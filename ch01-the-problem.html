@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The problem: one matrix multiply, 137 billion operations · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 1 · <em>Foundations</em></div>
+<h1>The problem: one matrix multiply, 137 billion operations</h1>
+<p class="lede">Before any kernel, the job. What a matrix multiply computes, how much work it is, what one unit of that work costs a GPU, and the scoreboard the rest of the book climbs.</p>
+<div class="byline">Problem · <em>C = A × B</em>, 4,092 × 4,092 · 137 GFLOP · the same job for all ten kernels</div>
+
+<p>All ten kernels in this book compute the same thing. The first one gets 1.3% of the machine and the last one gets 93.7%, and if you ran them side by side on the same two matrices you couldn't tell the outputs apart. Nothing in the ladder changes the arithmetic. What changes is how the numbers get to the arithmetic.</p>
+
+<p>So let's be exact about the job before we start rewriting it. There is no CUDA in this chapter. It covers what a matrix multiply computes, how many operations that comes to, what one of those operations costs on this particular card, and the chart we are trying to climb. If you already know that a 4,092 × 4,092 multiply is 137 GFLOP and that an A6000 peaks somewhere around 30 TFLOP/s, skip to chapter 2.</p>
+
+<h2><span class="no">1.1</span>The names on the box</h2>
+
+<p>The routine has a name, and the name is <em>SGEMM</em>: Single-precision GEneral Matrix Multiply. Single precision means 32-bit floats. General means the routine assumes nothing about the contents of the matrices — no symmetry, no band structure, no zeros it is allowed to skip. Every element gets multiplied by every element it should be multiplied by.</p>
+
+<p>The GEMM part comes from <em>BLAS</em>, the Basic Linear Algebra Subprograms. BLAS is a catalogue of routines agreed in the 1970s that every serious numerical library implements: dot products, matrix-vector products, matrix-matrix products, each with a fixed name and a fixed signature. The catalogue is why the same call can be answered by a different, faster library on a different machine without anybody rewriting the caller.</p>
+
+<p><em>cuBLAS</em> is NVIDIA's implementation of BLAS for its own GPUs. It ships with CUDA, it is closed source, and when PyTorch multiplies two matrices, this is very often the code that actually runs. It matters to us for one reason: it is the competitor. Every percentage in this book is a percentage of cuBLAS on the same problem and the same card, which makes cuBLAS 100% by definition. It's not a technique we are going to learn. It's the professionally tuned thing we are trying to catch, and in the last chapter we'll look at why the gap doesn't quite close.</p>
+
+<p>One footnote on the name before we drop it. GEMM does not compute C = AB. It computes C = αAB + βC, where α and β are scalars, so a caller can scale the product and accumulate it into an existing C. Those two scalars add two multiplies per output element and change nothing else in anything that follows, so this book treats the operation as C = AB and leaves them out.</p>
+
+<h2><span class="no">1.2</span>One cell of C</h2>
+
+<p>Here is the definition, and it is the whole operation:</p>
+
+<pre><code>C[i][j] = A[i][<span class="n">0</span>]·B[<span class="n">0</span>][j] + A[i][<span class="n">1</span>]·B[<span class="n">1</span>][j] + … + A[i][K-<span class="n">1</span>]·B[K-<span class="n">1</span>][j]
+
+<span class="c">// written with a sum:  C[i][j] = Σ over k of  A[i][k] · B[k][j]</span></code></pre>
+
+<p>Every element of C is the dot product of one row of A with one column of B. Take the top-left cell of a small example. Row 0 of A is 9, 6, 7, 9 and column 0 of B is 9, 7, 5, 7. Pair them off in order, multiply each pair, add the four products: 81 + 42 + 35 + 63 = 221. That is C[0][0]. Every other cell is the identical procedure with its own row and its own column.</p>
+
+<figure class="wide">
+  <div id="a-cell"></div>
+  <figcaption><b>Figure 1.1.</b> One cell of C, then all sixteen. The numbers are a real integer matrix product — the top-left corner of the 8 × 8 example used throughout the book — so you can check every product by eye.</figcaption>
+</figure>
+
+<p>Two things fall out of that picture. The first is a count: four multiplies and four adds for one cell. With rows of length K it is K multiplies and K adds, or 2K operations per output element. The 4 × 4 example has 16 cells at 8 operations each, which is 128 operations for the whole multiply, and 128 happens to be 2 × 4³.</p>
+
+<p>The second is about reuse, and it will matter for the next ten chapters. Row 0 of A was read to produce C[0][0], and it gets read again for C[0][1], C[0][2] and C[0][3] — every cell in row 0 of C wants the same row of A. Column 0 of B is likewise wanted by every cell in column 0 of C. In a 4,092 × 4,092 multiply, each row of A is needed 4,092 times over. Whether it is <em>fetched</em> 4,092 times is entirely up to the kernel, and that single question is most of what separates 1.3% from 93.7%.</p>
+
+<h2><span class="no">1.3</span>How big the job is</h2>
+
+<p>For square matrices of side N the multiply costs 2N³ floating-point operations: N² cells, each a dot product of length N, each dot product 2N operations. Cubic growth is easy to underestimate. Double the side and the work goes up eightfold, not twofold — the matrix gets four times as many cells and each cell gets twice as much work.</p>
+
+<figure class="wide">
+  <div id="a-scale"></div>
+  <figcaption><b>Figure 1.2.</b> The same job at four sizes. The bar has to be rescaled once on the way and still leaves the page at the end; the counters keep up because they are only text.</figcaption>
+</figure>
+
+<p>Simon Boehm's benchmark, which this book follows, uses N = 4,092. That is deliberately not a power of two. So:</p>
+
+<ul>
+<li>C has 4,092² = <b>16,744,464</b> elements, roughly 16.7 million.</li>
+<li>Each element needs 4,092 multiplies and 4,092 adds, which is <b>8,184</b> operations.</li>
+<li>The whole multiply is 2 × 4,092³ = <b>137,036,693,376</b> operations.</li>
+</ul>
+
+<p>That's 137 GFLOP, and it's the number in the title of this chapter. It's also the same 137 GFLOP for every kernel in the book. None of the ten does fewer operations than the others; there is no clever reformulation hiding in here that skips work. When kernel 10 finishes seventy times faster than kernel 1, it has done exactly as many multiplies and exactly as many adds.</p>
+
+<h2><span class="no">1.4</span>What a FLOP is, and what the machine can do</h2>
+
+<p>A FLOP is one floating-point operation: one multiply, or one add. Counting them is how we hold a job up against a machine, because a machine's headline speed is quoted in FLOPs per second.</p>
+
+<div class="aside">
+  <div class="t">Aside · FLOP and FLOP/s</div>
+  <p>The two are easy to mix up because they're one letter apart. A FLOP is a count of operations, so the job here is 137 GFLOP — a fixed amount of work, like a distance. A FLOP/s is a rate, so the card is 30 TFLOP/s — a speed. Divide the count by the rate and you get a time, which is the only reason either number is interesting.</p>
+</div>
+
+<p>GPUs don't issue a separate multiply and a separate add for a dot product. They have a fused multiply-add, an <em>FMA</em>, which computes a × b + c in one step. It is one instruction, it counts as two FLOPs, and one FP32 lane retires one FMA per clock cycle. That last sentence is where the machine's peak number comes from, and you can build the number by hand.</p>
+
+<p>The card in this book is an NVIDIA RTX A6000, an Ampere part. It has 84 streaming multiprocessors, usually written SMs. Each SM has 128 FP32 lanes. That's 84 × 128 = 10,752 lanes, and the base clock is 1.41 GHz. Multiply the three together, remembering that each lane's FMA is worth two FLOPs:</p>
+
+<figure class="wide">
+  <div id="a-lane"></div>
+  <figcaption><b>Figure 1.3.</b> Where 30.3 TFLOP/s comes from, built up from one lane. The four FMAs in the lane are the same dot product as Figure 1.1, chained through the third input.</figcaption>
+</figure>
+
+<p>NVIDIA's datasheet says 38.7 TFLOP/s, and both figures are correct: the datasheet uses the 1.80 GHz boost clock and this one uses the 1.41 GHz base clock. Boehm works with 30 TFLOP/s throughout, and so does this book.</p>
+
+<p>Now the division that sets up everything else. 137,036,693,376 FLOPs divided by 30 × 10¹² FLOPs per second is <b>4.6 milliseconds</b>. That's the floor. If all 10,752 lanes did useful arithmetic on every cycle from the first to the last, the multiply would take 4.6 ms, and no kernel — not ours, not cuBLAS, not anything — can go below it.</p>
+
+<p>Kernel 1 takes about 445 ms. cuBLAS takes 5.9.</p>
+
+<h2><span class="no">1.5</span>The scoreboard</h2>
+
+<p>Here is the whole book on one chart. Eight kernels rather than ten: Boehm's kernels 7 and 8 were experiments with shared-memory bank conflicts, they came out slower, and he skips them in his own writeup, so we skip them too. Everything is measured on the same 4,092 × 4,092 multiply on the same A6000.</p>
+
+<figure class="wide">
+  <div id="a-scoreboard"></div>
+  <figcaption><b>Figure 1.4.</b> The ladder, with cuBLAS at 100% and the hardware peak as a dashed line beyond it. All figures are Simon Boehm's measurements. The percentages are each kernel's throughput as a fraction of cuBLAS.</figcaption>
+</figure>
+
+<p>Two things to notice before we start climbing it.</p>
+
+<p>The first is where the speed actually comes from. Kernels 1 through 5 take the throughput from 309 to 15,972 GFLOP/s, a factor of 52, and every one of those steps is about memory: reading it in the right order, keeping a copy of it somewhere close, and making each thread do more arithmetic per byte it fetches. Boehm spent two weekends on kernels 1 to 6 and got to 80% of cuBLAS. The next four weekends went on autotuning and warptiling, and bought the remaining fourteen points. Keep the shape of that curve in mind when you reach the last three bars — most of the win is early and cheap, and the rest is late and expensive.</p>
+
+<p>The second is that even cuBLAS leaves a fifth of the chip unused: 23,250 GFLOP/s against a peak of 30,000, which is about 78%. Nobody reaches the right-hand edge of that chart. Chapter 14 gets into why.</p>
+
+<div class="key">
+  <div class="t">The framing sentence</div>
+  <p>Every kernel does the same 137 GFLOP. What changes from one kernel to the next is how many bytes must move to feed that arithmetic, and how many instructions get spent moving them.</p>
+</div>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Elements of C</div><div class="v">16.7<small>million</small></div><div class="d">4,092 × 4,092 = 16,744,464</div></div>
+  <div class="cell"><div class="l">FLOPs per element</div><div class="v">8,184</div><div class="d">4,092 multiplies + 4,092 adds</div></div>
+  <div class="cell acc"><div class="l">FLOPs in total</div><div class="v">137<small>GFLOP</small></div><div class="d">2 × 4,092³ = 137,036,693,376</div></div>
+  <div class="cell good"><div class="l">Arithmetic floor</div><div class="v">4.6<small>ms</small></div><div class="d">137 GFLOP ÷ 30 TFLOP/s</div></div>
+</div>
+
+<p>Which leaves the question the rest of the book is an answer to, and it is a subtraction. The arithmetic units on this card could finish the multiply in 4.6 ms. The obvious kernel takes 445. Where do the other 440 milliseconds go? Not into arithmetic, because every kernel does the same 137 GFLOP. They go into waiting — for bytes that arrive in the wrong shape, or in the wrong order, or that were already fetched thirty-one times before by somebody else.</p>
+
+<p>Chapter 2 puts a number on how much of that waiting the memory system can honestly account for. It's a smaller number than you would expect.</p>
+
+<div class="pager"></div>
+<div class="colophon">Every number in the animations is computed, not typed in: the 4 × 4 example is a real integer matrix product (the top-left corner of the 8 × 8 example shared with the rest of the book), 2N³ follows from the definition, and 30.3 TFLOP/s is 10,752 lanes × 2 FLOPs × 1.41 GHz worked out on screen. The GFLOP/s figures are Simon Boehm's A6000 measurements from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>; the hardware figures are from the RTX A6000 datasheet and the CUDA C++ Programming Guide.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+  const A4 = MB.A4, B4 = MB.B4, C4 = MB.C4;
+
+  // ------------------------------------------------------------ 1.1 one cell of C
+  (function () {
+    const S = MB.scene('a-cell', { w: 900, h: 480, title: 'One cell of C is the dot product of a row of A and a column of B' });
+    const tl = S.tl, cell = 34;
+    const aBase = '#eef4fd', bBase = '#eff8f3', cBase = '#fffaf4';
+
+    const A = S.matrix({ x: 90, y: 66, rows: 4, cols: 4, cell, values: A4, label: 'A', labelSize: 15, fill: aBase, stroke: '#c9c4bb' });
+    const B = S.matrix({ x: 382, y: 66, rows: 4, cols: 4, cell, values: B4, label: 'B', labelSize: 15, fill: bBase, stroke: '#c9c4bb' });
+    const C = S.matrix({ x: 674, y: 66, rows: 4, cols: 4, cell, values: C4, label: 'C = A × B', labelSize: 15, fill: cBase, stroke: '#c9c4bb', valueSize: 14 });
+    C.allVals().forEach(v => v.setNow({ opacity: 0 }));
+    S.text({ x: 304, y: 134, text: '×', anchor: 'middle', size: 20, fill: K.muted });
+    S.text({ x: 596, y: 134, text: '=', anchor: 'middle', size: 20, fill: K.muted });
+
+    // moving highlight frames
+    const aBand = S.rect({ x: A.left() - 3, y: A.top() - 3, w: 4 * cell + 6, h: cell + 6, fill: 'none', stroke: K.A, sw: 1.8, rx: 3, opacity: 0 });
+    const bBand = S.rect({ x: B.left() - 3, y: B.top() - 3, w: cell + 6, h: 4 * cell + 6, fill: 'none', stroke: K.B, sw: 1.8, rx: 3, opacity: 0 });
+    const cBand = S.rect({ x: C.left() - 3, y: C.top() - 3, w: cell + 6, h: cell + 6, fill: 'none', stroke: K.C, sw: 2, rx: 3, opacity: 0 });
+
+    // the four products, computed
+    const prods = A4[0].map((v, k) => v * B4[k][0]);
+    const cum = []; prods.reduce((s, p) => { s += p; cum.push(s); return s; }, 0);
+
+    const eqY = 306;
+    const head = S.text({ x: 90, y: 254, text: 'A[0][k] × B[k][0]   for k = 0, 1, 2, 3', font: 'mono', size: 12.5, fill: K.muted, opacity: 0 });
+    const slots = [];
+    for (let k = 0; k < 4; k++) {
+      const g = S.group({ tx: 90 + k * 108, ty: eqY, opacity: 0 });
+      g.rect({ x: 0, y: -26, w: 92, h: 52, fill: '#fff', stroke: K.rule, rx: 6 });
+      const f = g.text({ x: 46, y: -11, text: '', anchor: 'middle', size: 12.5, fill: K.muted });
+      const p = g.text({ x: 46, y: 11, text: '', anchor: 'middle', size: 17, fill: K.ink, weight: 600 });
+      g.text({ x: 46, y: 42, text: 'k = ' + k, anchor: 'middle', size: 10.5, fill: K.faint });
+      slots.push({ g, f, p });
+    }
+    const sigma = S.text({ x: 546, y: eqY, text: '= Σ', anchor: 'middle', size: 16, fill: K.muted, opacity: 0 });
+    const panel = S.rect({ x: 580, y: eqY - 30, w: 236, h: 60, fill: '#fff', stroke: K.rule, sw: 1, rx: 8, opacity: 0 });
+    const panelL = S.text({ x: 698, y: 264, text: 'running total', anchor: 'middle', size: 11.5, fill: K.muted, opacity: 0 });
+    const total = S.counter({ x: 698, y: eqY + 2, value: 0, size: 26, anchor: 'middle', opacity: 0 });
+
+    const led1 = S.text({ x: 90, y: 392, text: '', font: 'mono', size: 12.5, fill: K.accent, weight: 600, opacity: 0 });
+    const led2 = S.text({ x: 90, y: 424, text: '', font: 'mono', size: 12.5, fill: K.ink, weight: 600, opacity: 0 });
+    const led3 = S.text({ x: 90, y: 450, text: '', size: 12, fill: K.muted, opacity: 0 });
+
+    // flying value chips
+    const fly = [];
+    for (let k = 0; k < 4; k++) {
+      const [ax, ay] = A.center(0, k), [bx, by] = B.center(k, 0);
+      const fa = S.group({ tx: ax, ty: ay, opacity: 0 });
+      fa.rect({ x: -15, y: -13, w: 30, h: 26, fill: K.Afill, stroke: K.A, rx: 4 });
+      fa.text({ x: 0, y: 0.5, text: A4[0][k], anchor: 'middle', size: 14, weight: 600 });
+      const fb = S.group({ tx: bx, ty: by, opacity: 0 });
+      fb.rect({ x: -15, y: -13, w: 30, h: 26, fill: K.Bfill, stroke: K.B, rx: 4 });
+      fb.text({ x: 0, y: 0.5, text: B4[k][0], anchor: 'middle', size: 14, weight: 600 });
+      fly.push({ fa, fb });
+    }
+
+    tl.step('Every cell of C is a dot product: one <b>row of A</b> with one <b>column of B</b>. Take C[0][0]. It needs row 0 of A and column 0 of B, and nothing else.');
+    tl.to(A.row(0), { fill: K.Afill, stroke: K.A, sw: 1.2 }, 0.3, { stagger: 0.05 });
+    tl.to(B.col(0), { fill: K.Bfill, stroke: K.B, sw: 1.2 }, 0.3, { at: '<', stagger: 0.05 });
+    tl.to(C.cellAt(0, 0), { fill: K.Cfill, stroke: K.C, sw: 1.6 }, 0.4, { at: '<' });
+    tl.show([aBand, bBand, cBand], 0.4, { at: '<+0.2' });
+    tl.wait(1.8);
+
+    tl.step('Pair the numbers off in order and multiply: <b>' + A4[0].map((v, k) => v + ' × ' + B4[k][0]).join(', ') + '</b>. Four pairs, four products, and a running total that carries the sum so far.');
+    tl.show([head, sigma, panel, panelL, total], 0.4);
+    tl.wait(0.8);
+
+    function doK(k) {
+      const { fa, fb } = fly[k], sx = 90 + k * 108;
+      tl.to(A.cellAt(0, k), { fill: '#a9c6f5', sw: 2 }, 0.2);
+      tl.to(B.cellAt(k, 0), { fill: '#a7dfbb', sw: 2 }, 0.2, { at: '<' });
+      tl.show([fa, fb], 0.15, { at: '<' });
+      tl.move(fa, sx + 26, eqY - 11, 0.7, { arc: -34 });
+      tl.move(fb, sx + 66, eqY - 11, 0.7, { at: '<', arc: 34 });
+      tl.show(slots[k].g, 0.25, { at: '<+0.35' });
+      tl.hide([fa, fb], 0.2);
+      tl.set(slots[k].f, { text: A4[0][k] + ' × ' + B4[k][0] }, '<');
+      tl.set(slots[k].p, { text: '' + prods[k] }, '<');
+      tl.to(total.num, { value: cum[k] }, 0.4, { at: '<' });
+      tl.to(A.cellAt(0, k), { fill: K.Afill, sw: 1.2 }, 0.3, { at: '<' });
+      tl.to(B.cellAt(k, 0), { fill: K.Bfill, sw: 1.2 }, 0.3, { at: '<' });
+      tl.wait(0.85);
+    }
+    for (let k = 0; k < 4; k++) doK(k);
+
+    tl.step('Add the four products and the cell is finished: <b>' + prods.join(' + ') + ' = ' + C4[0][0] + '</b>. That took 4 multiplies and 4 adds — <b>8 floating-point operations</b> for one number.');
+    tl.to(total.num, { fill: K.C }, 0.3);
+    tl.show(C.valAt(0, 0), 0.5, { at: '<' });
+    tl.to(C.cellAt(0, 0), { fill: '#f9c9a0' }, 0.3, { at: '<' });
+    tl.set(led1, { text: 'C[0][0] = ' + C4[0][0] + '   ·   4 multiplies + 4 adds = 8 FLOPs' }, '<');
+    tl.show(led1, 0.4);
+    tl.wait(2.0);
+
+    tl.step('Every other cell works the same way, with its own row and its own column. Watch the row slide down A while the column slides across B.');
+    tl.to([total.num, sigma, panel, panelL, head], { opacity: 0.25 }, 0.4);
+    tl.to(slots.map(s => s.g), { opacity: 0.25 }, 0.4, { at: '<' });
+    tl.wait(0.5);
+    const order = [];
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) if (r || c) order.push([r, c]);
+    let prev = [0, 0];
+    order.forEach(([r, c]) => {
+      tl.to(A.row(prev[0]), { fill: aBase, stroke: '#c9c4bb', sw: 0.7 }, 0.1);
+      tl.to(B.col(prev[1]), { fill: bBase, stroke: '#c9c4bb', sw: 0.7 }, 0.1, { at: '<' });
+      tl.to(A.row(r), { fill: K.Afill, stroke: K.A, sw: 1.2 }, 0.14, { at: '<' });
+      tl.to(B.col(c), { fill: K.Bfill, stroke: K.B, sw: 1.2 }, 0.14, { at: '<' });
+      tl.to(aBand, { y: A.top() - 3 + r * cell }, 0.16, { at: '<', ease: 'out' });
+      tl.to(bBand, { x: B.left() - 3 + c * cell }, 0.16, { at: '<', ease: 'out' });
+      tl.to(cBand, { x: C.left() - 3 + c * cell, y: C.top() - 3 + r * cell }, 0.16, { at: '<', ease: 'out' });
+      tl.show(C.valAt(r, c), 0.16, { at: '<+0.1' });
+      tl.to(C.cellAt(r, c), { fill: K.Cfill, stroke: K.C, sw: 1.1 }, 0.16, { at: '<' });
+      tl.wait(0.14);
+      prev = [r, c];
+    });
+    tl.wait(1.2);
+
+    tl.step('Sixteen cells at 8 FLOPs each is <b>128 FLOPs</b> for the whole multiply — and 128 is exactly 2 × 4³. The pattern is <b>2N³</b>, and N is about to get much larger.');
+    tl.hide([aBand, bBand, cBand], 0.4);
+    tl.set(led2, { text: '16 cells × 8 FLOPs = 128 FLOPs,  and  128 = 2 × 4³' }, '<');
+    tl.set(led3, { text: 'for square matrices of side N, one multiply costs 2N³ floating-point operations' }, '<');
+    tl.show([led2, led3], 0.5, { stagger: 0.15 });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 1.2 2N cubed
+  (function () {
+    const S = MB.scene('a-scale', { w: 900, h: 400, title: 'The cost of a matrix multiply grows as 2N cubed' });
+    const tl = S.tl;
+    const SX = 60, SY = 84, SIDE = 224;
+
+    S.text({ x: SX + SIDE / 2, y: 62, text: 'C — one cell per output element', anchor: 'middle', size: 13, fill: K.ink, weight: 600 });
+    function gridOf(n, sw) {
+      const g = S.group({ tx: SX, ty: SY, opacity: 0 });
+      g.rect({ x: 0, y: 0, w: SIDE, h: SIDE, fill: K.Cfill, stroke: K.C, sw: 1.3, rx: 1 });
+      const st = SIDE / n;
+      for (let i = 1; i < n; i++) {
+        g.line({ x1: i * st, y1: 0, x2: i * st, y2: SIDE, stroke: K.C, sw: sw });
+        g.line({ x1: 0, y1: i * st, x2: SIDE, y2: i * st, stroke: K.C, sw: sw });
+      }
+      return g;
+    }
+    const g4 = gridOf(4, 1.0), g8 = gridOf(8, 0.8), g16 = gridOf(16, 0.55), g32 = gridOf(32, 0.35), g64 = gridOf(64, 0.22);
+    const gSolid = S.group({ tx: SX, ty: SY, opacity: 0 });
+    gSolid.rect({ x: 0, y: 0, w: SIDE, h: SIDE, fill: K.Cdeep, stroke: K.Cdeep, sw: 1.3, rx: 1 });
+    const cap = S.text({ x: SX + SIDE / 2, y: 330, text: '', anchor: 'middle', size: 15, fill: K.ink, weight: 600 });
+    const cap2 = S.text({ x: SX + SIDE / 2, y: 352, text: '', anchor: 'middle', size: 11.5, fill: K.muted });
+
+    const X0 = 350, BW = 440, SCALE1 = 2 * 8 * 8 * 8, SCALE2 = 2 * 64 * 64 * 64;
+    const cN = S.counter({ x: X0, y: 84, label: 'N — the side of each matrix', value: 0, size: 26, format: v => MB.fmt(v) });
+    const cCell = S.counter({ x: X0, y: 140, label: 'cells in C   (N²)', value: 0, size: 26, format: v => MB.fmt(v) });
+    const cFlop = S.counter({ x: X0, y: 196, label: 'FLOPs   (2N³)', value: 0, size: 26, fill: K.accent, format: v => MB.fmt(v) });
+    S.rect({ x: X0, y: 250, w: BW, h: 20, fill: '#f5f3ec', stroke: K.rule, sw: 0.8, rx: 3 });
+    const bar = S.bar({ x: X0, y: 250, w: 0, h: 20, fill: K.Cfill, stroke: K.C, value: 0, valueSize: 12, format: v => MB.fmt(v) });
+    const scaleNote = S.text({ x: X0, y: 292, text: '', size: 11.5, fill: K.muted });
+    const overflow = S.text({ x: X0, y: 316, text: '', size: 12, fill: K.red, weight: 600 });
+    const offArrow = S.arrow({ x1: X0 + BW + 6, y1: 260, x2: 872, y2: 260, stroke: K.red, sw: 2, opacity: 0 });
+    const floorLine = S.text({ x: 60, y: 374, text: '', font: 'mono', size: 12.5, fill: K.accent, weight: 600, opacity: 0 });
+
+    const w1 = f => Math.max(2, BW * f / SCALE1);
+    const w2 = f => Math.max(2, BW * f / SCALE2);
+    const flops = n => 2 * n * n * n;
+
+    tl.step('Start small. A <b>4 × 4</b> multiply has 16 cells, and each one is 8 FLOPs — 128 in total, the number we counted by hand a moment ago.');
+    tl.show(g4, 0.5);
+    tl.set(cap, { text: '4 × 4' }, '<');
+    tl.set(cap2, { text: 'sixteen cells, countable by eye' }, '<');
+    tl.to(cN.num, { value: 4 }, 0.6, { at: '<' });
+    tl.to(cCell.num, { value: 16 }, 0.6, { at: '<' });
+    tl.to(cFlop.num, { value: flops(4) }, 0.6, { at: '<' });
+    tl.set(scaleNote, { text: 'bar scale: the full track is 1,024 FLOPs' }, '<');
+    bar.grow(tl, w1(flops(4)), flops(4), 0.7, { at: '<' });
+    tl.wait(2.0);
+
+    tl.step('Double the side to <b>8 × 8</b> and the work goes up eightfold, not twofold: four times as many cells, each one twice as long a dot product. 1,024 FLOPs, and the bar is already full.');
+    tl.hide(g4, 0.4);
+    tl.show(g8, 0.4, { at: '<' });
+    tl.set(cap, { text: '8 × 8' }, '<');
+    tl.set(cap2, { text: '64 cells' }, '<');
+    tl.to(cN.num, { value: 8 }, 0.7, { at: '<' });
+    tl.to(cCell.num, { value: 64 }, 0.7, { at: '<' });
+    tl.to(cFlop.num, { value: flops(8) }, 0.7, { at: '<' });
+    bar.grow(tl, w1(flops(8)), flops(8), 0.8, { at: '<' });
+    tl.wait(2.0);
+
+    tl.step('Keep going to <b>64 × 64</b>, still a tiny matrix by any standard, and it needs <b>524,288</b> FLOPs. The bar had to be rescaled by 512× to fit that, which makes the 8 × 8 job a hairline.');
+    tl.hide(g8, 0.3);
+    tl.show(g16, 0.3, { at: '<' });
+    tl.wait(0.35);
+    tl.hide(g16, 0.3);
+    tl.show(g32, 0.3, { at: '<' });
+    tl.wait(0.35);
+    tl.hide(g32, 0.3);
+    tl.show(g64, 0.3, { at: '<' });
+    tl.set(cap, { text: '64 × 64' }, '<');
+    tl.set(cap2, { text: '4,096 cells' }, '<');
+    tl.set(scaleNote, { text: 'bar rescaled: the full track is now 524,288 FLOPs' }, '<');
+    bar.grow(tl, w2(flops(8)), flops(8), 0.4, { at: '<' });
+    tl.to(cN.num, { value: 64 }, 1.0);
+    tl.to(cCell.num, { value: 64 * 64 }, 1.0, { at: '<' });
+    tl.to(cFlop.num, { value: flops(64) }, 1.0, { at: '<' });
+    bar.grow(tl, w2(flops(64)), flops(64), 1.0, { at: '<' });
+    tl.wait(2.2);
+
+    tl.step('Boehm\'s matrices are <b>4,092 × 4,092</b>. That is 16,744,464 cells, each one a dot product of 4,092 pairs: <b>137,036,693,376</b> FLOPs. The grid lines have merged into a solid block, and the bar has left the page.');
+    tl.hide(g64, 0.4);
+    tl.show(gSolid, 0.4, { at: '<' });
+    tl.set(cap, { text: '4,092 × 4,092' }, '<');
+    tl.set(cap2, { text: '16,744,464 cells' }, '<');
+    tl.to(cN.num, { value: 4092 }, 1.2, { at: '<' });
+    tl.to(cCell.num, { value: 4092 * 4092 }, 1.2, { at: '<' });
+    tl.to(cFlop.num, { value: flops(4092) }, 1.2, { at: '<' });
+    tl.to(bar.rect, { width: BW, fill: K.redfill, stroke: K.red }, 1.2, { at: '<' });
+    tl.to(bar.value, { opacity: 0 }, 0.4, { at: '<' });
+    tl.show(offArrow, 0.4);
+    tl.set(overflow, { text: 'at this scale the bar would run ' + MB.fmt(Math.round(flops(4092) / SCALE2)) + ' × the width of the track' }, '<');
+    tl.wait(2.4);
+
+    tl.step('137 billion floating-point operations for one multiply. The machine does about 30 trillion per second, so this should take <b>4.6 ms</b>. The first kernel takes <b>445</b>.');
+    tl.set(floorLine, { text: '137 GFLOP ÷ 30 TFLOP/s = 4.6 ms   ·   kernel 1 takes 445 ms' }, '<');
+    tl.show(floorLine, 0.5);
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 1.3 the lane
+  (function () {
+    const S = MB.scene('a-lane', { w: 900, h: 470, title: 'One FMA per lane per clock, 10,752 lanes, 1.41 GHz' });
+    const tl = S.tl;
+
+    // the same dot product as figure 1.1, chained through c
+    const chain = []; let acc = 0;
+    for (let k = 0; k < 4; k++) { const a = A4[0][k], b = B4[k][0], c = acc; acc = a * b + c; chain.push({ a: a, b: b, c: c, out: acc }); }
+
+    const laneBox = S.membox({ x: 110, y: 104, w: 180, h: 92, label: 'one FP32 lane', labelPos: 'top', labelSize: 12, fill: K.tealfill, stroke: K.teal, rx: 10, opacity: 0 });
+    const formula = S.text({ x: 200, y: 150, text: 'a × b + c', anchor: 'middle', size: 19, font: 'mono', fill: K.ink, weight: 600, opacity: 0 });
+    const fnote = S.text({ x: 200, y: 176, text: 'a fused multiply-add', anchor: 'middle', size: 10.5, fill: K.muted, opacity: 0 });
+    const chipName = ['a', 'b', 'c'];
+    const chips = [0, 1, 2].map(i => {
+      const g = S.group({ tx: 112 + i * 56, ty: 56, opacity: 0 });
+      g.rect({ x: 0, y: 0, w: 48, h: 28, fill: '#fff', stroke: K.rule, rx: 5 });
+      g.text({ x: 24, y: -10, text: chipName[i], anchor: 'middle', size: 11, font: 'mono', fill: K.muted });
+      const v = g.text({ x: 24, y: 14.5, text: '', anchor: 'middle', size: 15, fill: K.ink, weight: 600 });
+      return { g: g, v: v };
+    });
+    const feed = [0, 1, 2].map(i => S.arrow({ x1: 136 + i * 56, y1: 86, x2: 136 + i * 56, y2: 101, stroke: '#9b978d', sw: 1.3, opacity: 0 }));
+    const outArrow = S.arrow({ x1: 200, y1: 197, x2: 200, y2: 210, stroke: '#9b978d', sw: 1.3, opacity: 0 });
+    const outG = S.group({ tx: 152, ty: 212, opacity: 0 });
+    outG.rect({ x: 0, y: 0, w: 96, h: 32, fill: K.tealfill, stroke: K.teal, rx: 6 });
+    const outV = outG.text({ x: 48, y: 16.5, text: '', anchor: 'middle', size: 17, fill: K.teal, weight: 600 });
+    const fmaNote = S.text({ x: 200, y: 268, text: 'one FMA = 1 multiply + 1 add = 2 FLOPs', anchor: 'middle', size: 11.5, fill: K.muted, opacity: 0 });
+
+    const clockG = S.group({ tx: 400, ty: 120, opacity: 0 });
+    clockG.circle({ cx: 0, cy: 0, r: 26, fill: '#fff', stroke: K.muted, sw: 1.2 });
+    for (let i = 0; i < 12; i++) {
+      const a = i * Math.PI / 6;
+      clockG.line({ x1: Math.sin(a) * 21, y1: -Math.cos(a) * 21, x2: Math.sin(a) * 24, y2: -Math.cos(a) * 24, stroke: K.faint, sw: 1 });
+    }
+    const hand = S.group({ tx: 400, ty: 120, opacity: 0 });
+    hand.line({ x1: 0, y1: 0, x2: 0, y2: -18, stroke: K.accent, sw: 2 });
+    hand.circle({ cx: 0, cy: 0, r: 2.6, fill: K.accent });
+    const cFma = S.counter({ x: 400, y: 170, label: 'FMAs completed', value: 0, size: 22, anchor: 'middle', opacity: 0 });
+    const cRate = S.counter({ x: 400, y: 226, label: 'clock ticks per second', value: 0, size: 21, anchor: 'middle', opacity: 0, format: v => MB.fmt(v) });
+    const rateNote = S.text({ x: 400, y: 268, text: '', anchor: 'middle', size: 12, fill: K.muted });
+
+    const LN = S.threads({ x: 560, y: 96, n: 128, size: 11, gap: 3, perRow: 16, fill: '#d5e8e4', stroke: K.teal, label: 'one SM — 128 FP32 lanes', labelPos: 'top', labelSize: 12, opacity: 0 });
+    const SM = S.threads({ x: 560, y: 252, n: 84, size: 16, gap: 5, perRow: 12, fill: K.greyfill, stroke: K.grey, label: 'the A6000 — 84 SMs', labelPos: 'top', labelSize: 12, opacity: 0 });
+
+    const mulLine = S.text({ x: 60, y: 424, text: '10,752 lanes  ×  2 FLOPs per cycle  ×  1.41 GHz  =  30.3 TFLOP/s', font: 'mono', size: 13.5, fill: K.accent, weight: 600, opacity: 0 });
+    const dsNote = S.text({ x: 60, y: 448, text: 'the datasheet quotes 38.7 TFLOP/s, which assumes the 1.80 GHz boost clock — Boehm works with 30, and so does this book', size: 11.5, fill: K.muted, opacity: 0 });
+
+    const fp = S.membox({ x: 60, y: 300, w: 250, h: 96, fill: '#faf9f5', stroke: K.rule, rx: 10, opacity: 0 });
+    const f1 = S.text({ x: 76, y: 324, text: '137 GFLOP ÷ 30 TFLOP/s', font: 'mono', size: 12.5, fill: K.muted, opacity: 0 });
+    const f2 = S.text({ x: 76, y: 356, text: '= 4.6 ms', size: 26, fill: K.teal, weight: 600, opacity: 0 });
+    const f3 = S.text({ x: 76, y: 382, text: 'the arithmetic floor — nothing beats it', size: 11, fill: K.muted, opacity: 0 });
+
+    tl.step('A <b>FLOP</b> is one floating-point operation: one multiply, or one add. An FP32 lane does both at once, as a <b>fused multiply-add</b> — <code>a × b + c</code> in a single instruction, which counts as 2 FLOPs.');
+    tl.show([laneBox, formula, fnote], 0.5, { stagger: 0.12 });
+    tl.show([clockG, hand, cFma], 0.4, { at: '<+0.2' });
+    tl.show(feed, 0.3);
+    tl.show([outArrow, fmaNote], 0.3, { at: '<' });
+    tl.wait(1.4);
+
+    function doFma(k) {
+      const c = chain[k];
+      tl.set(chips[0].v, { text: '' + c.a });
+      tl.set(chips[1].v, { text: '' + c.b }, '<');
+      tl.set(chips[2].v, { text: '' + c.c }, '<');
+      tl.show([chips[0].g, chips[1].g, chips[2].g], 0.25, { at: '<' });
+      tl.to(hand, { rot: 360 * (k + 1) }, 0.7, { ease: 'linear' });
+      tl.to(laneBox.box, { fill: '#b7ddd5' }, 0.3, { at: '<' });
+      tl.to(laneBox.box, { fill: K.tealfill }, 0.4);
+      tl.show(outG, 0.25, { at: '<' });
+      tl.set(outV, { text: '' + c.out }, '<');
+      tl.to(cFma.num, { value: k + 1 }, 0.3, { at: '<' });
+      tl.wait(0.8);
+    }
+    doFma(0);
+    tl.step('The four values running through it are the dot product from Figure 1.1, chained: each cycle\'s output becomes the next cycle\'s <code>c</code>. After four cycles the lane holds <b>' + chain[3].out + '</b>.');
+    doFma(1); doFma(2); doFma(3);
+    tl.wait(1.0);
+
+    tl.step('A lane can start a new FMA on every clock cycle, and the A6000\'s base clock ticks <b>1,410,000,000</b> times a second. So one lane on its own is worth 2.82 billion FLOPs per second.');
+    tl.show(cRate, 0.4);
+    tl.to(cRate.num, { value: 1.41e9 }, 1.5, { at: '<', ease: 'linear' });
+    tl.to(hand, { rot: 360 * 4 + 360 * 8 }, 1.5, { at: '<', ease: 'linear' });
+    tl.set(rateNote, { text: '= 1.41 GHz, the base clock' }, '<');
+    tl.wait(1.6);
+
+    tl.step('One lane is not much. An <b>SM</b> — a streaming multiprocessor, the unit a block of threads runs on — has <b>128</b> of them, and they all issue in the same cycle.');
+    tl.show(LN, 0.4);
+    tl.to(LN.items, { fill: K.tealfill }, 0.12, { at: '<+0.2', stagger: 0.008 });
+    tl.wait(1.6);
+
+    tl.step('And the card carries <b>84</b> SMs. 84 × 128 = <b>10,752</b> FP32 lanes, every one of them able to retire an FMA on every cycle.');
+    tl.show(SM, 0.4);
+    tl.to(SM.items, { fill: K.tealfill, stroke: K.teal }, 0.12, { at: '<+0.2', stagger: 0.02 });
+    tl.wait(1.6);
+
+    tl.step('Multiply the three numbers together: <b>10,752 lanes × 2 FLOPs × 1.41 GHz ≈ 30.3 TFLOP/s</b>. That is the peak this chip can do in fp32, and it is a ceiling, not a promise.');
+    tl.show(mulLine, 0.5);
+    tl.show(dsNote, 0.4, { at: '<+0.3' });
+    tl.wait(2.6);
+
+    tl.step('Divide the job by the peak: <b>137 GFLOP ÷ 30 TFLOP/s = 4.6 ms</b>. No kernel in this book goes below that line. The whole book is about getting near it.');
+    tl.show([fp, f1, f2, f3], 0.5, { stagger: 0.12 });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 1.4 the scoreboard
+  (function () {
+    const S = MB.scene('a-scoreboard', { w: 900, h: 520, title: 'Eight kernels and cuBLAS on the same 4,092 by 4,092 multiply' });
+    const tl = S.tl;
+    const CUB = 23249.6, PEAK = 30000;
+    const rows = [
+      { name: 'Kernel 1 · naive', g: 309.0 },
+      { name: 'Kernel 2 · coalescing', g: 1986.5 },
+      { name: 'Kernel 3 · shared memory', g: 2980.3 },
+      { name: 'Kernel 4 · 1D blocktiling', g: 8474.7 },
+      { name: 'Kernel 5 · 2D blocktiling', g: 15971.7 },
+      { name: 'Kernel 6 · vectorized', g: 18237.3 },
+      { name: 'Kernel 9 · autotuning', g: 19721.0 },
+      { name: 'Kernel 10 · warptiling', g: 21779.3 },
+      { name: 'cuBLAS', g: CUB, ref: true },
+    ];
+    const X0 = 250, W = 470, Y0 = 96, DY = 38, BH = 20;
+    const px = g => W * g / PEAK;
+    const pctOf = g => (g >= CUB ? '100%' : (g / CUB * 100).toFixed(1) + '%');
+
+    const items = rows.map((r, i) => {
+      const y = Y0 + i * DY;
+      const track = S.rect({ x: X0, y: y, w: W, h: BH, fill: '#f5f3ec', stroke: K.rule, sw: 0.8, rx: 3, opacity: 0 });
+      const bar = S.bar({ x: X0, y: y, w: 0, h: BH, fill: r.ref ? K.Cfill : K.Afill, stroke: r.ref ? K.C : K.A,
+        label: r.name, labelSize: 12.5, valueSize: 12, value: 0, format: v => MB.fmt(v), opacity: 0 });
+      const pct = S.text({ x: 880, y: y + BH / 2 + 0.5, text: '', anchor: 'end', size: 12.5, fill: r.ref ? K.C : K.muted, weight: 600 });
+      return { r: r, y: y, track: track, bar: bar, pct: pct };
+    });
+
+    const peakX = X0 + W;
+    const peakLine = S.line({ x1: peakX, y1: Y0 - 16, x2: peakX, y2: Y0 + (rows.length - 1) * DY + BH + 12, stroke: K.grey, sw: 1.4, dash: '5 4', opacity: 0 });
+    const peakLbl = S.text({ x: peakX - 8, y: 72, text: 'hardware peak · 30,000', anchor: 'end', size: 12, fill: K.grey, weight: 600, opacity: 0 });
+    const unitHdr = S.text({ x: X0, y: 72, text: 'GFLOP/s', size: 11.5, fill: K.muted, opacity: 0 });
+    const pctHdr = S.text({ x: 880, y: 72, text: '% of cuBLAS', anchor: 'end', size: 11.5, fill: K.muted, opacity: 0 });
+    const sum1 = S.text({ x: 60, y: 462, text: '', font: 'mono', size: 12.5, fill: K.accent, weight: 600, opacity: 0 });
+    const sum2 = S.text({ x: 60, y: 486, text: '', font: 'mono', size: 12.5, fill: K.muted, opacity: 0 });
+
+    function grow(i, dur, gap) {
+      const it = items[i];
+      tl.show([it.track, it.bar], 0.25);
+      it.bar.grow(tl, px(it.r.g), it.r.g, dur, { at: '<' });
+      tl.set(it.pct, { text: pctOf(it.r.g) }, '<+' + dur);
+      tl.wait(gap === undefined ? 0.3 : gap);
+    }
+
+    tl.step('Start with the reference. <b>cuBLAS</b> is NVIDIA\'s own library, and on this problem it reaches <b>23,250 GFLOP/s</b> — 100%, by definition. The dashed line past it is the hardware peak: 30,000.');
+    tl.show([unitHdr, pctHdr], 0.3);
+    tl.show([peakLine, peakLbl], 0.5, { at: '<' });
+    grow(8, 1.3, 0.2);
+    tl.wait(2.0);
+
+    tl.step('Now the obvious kernel — one thread per output element, a loop over k. <b>309 GFLOP/s</b>, or <b>1.3%</b> of cuBLAS. At this scale you have to look for it.');
+    grow(0, 0.8, 0.2);
+    tl.wait(2.2);
+
+    tl.step('Kernels 2 to 5 change how memory is read and how much work each thread holds on to. <b>309 → 15,972 GFLOP/s</b>, a factor of <b>' + Math.round(15971.7 / 309) + '</b>, and almost all of this book\'s speedup lives in those four rewrites.');
+    [1, 2, 3, 4].forEach(i => grow(i, 0.7, 0.35));
+    tl.wait(2.2);
+
+    tl.step('The last three bars are increasingly specialist work: 128-bit loads, an autotuner over the tile shapes, and a warp-level tile. Together they add <b>' + Math.round((21779.3 / 15971.7 - 1) * 100) + '%</b> on top of kernel 5.');
+    [5, 6, 7].forEach(i => grow(i, 0.7, 0.35));
+    tl.wait(2.2);
+
+    tl.step('And nobody reaches the right-hand edge. Even cuBLAS gets <b>23,250 of a possible 30,000</b> — about <b>' + Math.round(Math.round(CUB) / PEAK * 100) + '%</b> of the arithmetic the chip can do. The last chapter is about that gap.');
+    tl.to(items[8].bar.rect, { fill: '#f9c9a0' }, 0.5);
+    tl.set(sum1, { text: 'kernels 1 → 5:   309 → 15,972 GFLOP/s   ·   ' + Math.round(15971.7 / 309) + '× in four rewrites' }, '<');
+    tl.set(sum2, { text: 'kernels 5 → 10:  +' + Math.round((21779.3 / 15971.7 - 1) * 100) + '%   ·   cuBLAS: 23,250 of a possible 30,000, or ' + Math.round(Math.round(CUB) / PEAK * 100) + '%' }, '<');
+    tl.show([sum1, sum2], 0.5, { stagger: 0.15 });
+    tl.wait(3.2);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

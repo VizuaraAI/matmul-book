@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two clocks: compute-bound or memory-bound · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 2 · <em>Foundations</em></div>
+<h1>Two clocks: compute-bound or memory-bound</h1>
+<p class="lede">A kernel waits on the arithmetic or it waits on the bytes. For this multiply the answer should be the arithmetic, by a factor of thirteen — and the first kernel manages to get the other answer.</p>
+<div class="byline">Two limits · <em>30 TFLOP/s of arithmetic, 768 GB/s of memory</em> · which one a kernel hits decides everything</div>
+
+<p>Chapter 1 ended on a subtraction. The FP32 units on this card could finish the multiply in 4.6 milliseconds, and the obvious kernel takes 445. Four hundred and forty milliseconds go somewhere, and not into arithmetic, because every kernel in the book does the same 137 GFLOP.</p>
+
+<p>They go into waiting. The useful thing about a GPU kernel is that there are only two things it can wait for: the lanes that do the multiplying, and the bytes that feed them. Whichever of those runs out first sets the runtime, and the other one has slack. So the job of this chapter is to time the multiply twice — once against the arithmetic, once against the memory — and see which clock is the slow one. Both numbers are already on the table from chapter 1.</p>
+
+<h2><span class="no">2.1</span>The arithmetic clock</h2>
+
+<p>The first clock we've met. The multiply is 137,036,693,376 floating-point operations, the card retires about 30 trillion of them per second, and dividing one by the other gives 4.6 ms.</p>
+
+<p>What makes that number worth writing down is that it doesn't depend on any decision a kernel author gets to make. The 137 GFLOP is fixed by the problem: 4,092² output cells, each a dot product of length 4,092, no shortcuts available in a general matrix multiply. The 30 TFLOP/s is fixed by the silicon: 10,752 lanes, one fused multiply-add each per cycle, 1.41 GHz. Their ratio is a floor. Every kernel in this book is above it, cuBLAS included, and nothing anyone writes will go below it.</p>
+
+<p>Call that the arithmetic clock. It reads 4.6 ms.</p>
+
+<h2><span class="no">2.2</span>The memory clock</h2>
+
+<p>The second clock counts bytes instead of operations. It asks a different question: how long would this multiply take if the arithmetic were free and the only cost were moving the data?</p>
+
+<p>A, B and C are each 4,092 × 4,092 single-precision floats, four bytes apiece, which is about 67 MB per matrix. Now ask what has to cross between the card's memory and its SMs, at an absolute minimum, for the multiply to be possible at all. A has to be read: every element of it is needed. B has to be read. C has to be written, and in a full GEMM it also has to be read, because the routine accumulates into it — that's the βC term chapter 1 set aside. Four passes over 67 MB comes to about 268 MB.</p>
+
+<p>At 768 GB/s, 268 MB takes <b>0.35 ms</b>.</p>
+
+<p>I should be honest about what that number is. It's a lower bound in the same sense as the arithmetic floor, not a prediction: it assumes each byte crosses the bus exactly once, which requires that the kernel never has to go back for a value it already had. No kernel achieves it — kernel 1 misses it by a factor of two thousand, and even kernel 5, seven chapters of work later, is still sixteen times above it. But nothing beats it either, because the data does have to arrive.</p>
+
+<figure class="wide">
+  <div id="a-clocks"></div>
+  <figcaption><b>Figure 2.1.</b> The two clocks running on the same time axis, for a kernel that wastes nothing. The memory clock finishes at 0.35 ms and then has nothing to do; the arithmetic clock runs on to 4.6 ms. (The playback rate changes once, and the animation says when.)</figcaption>
+</figure>
+
+<h2><span class="no">2.3</span>Compute-bound, memory-bound, and the roofline</h2>
+
+<p>Two clocks, 4.6 ms and 0.35 ms. A kernel isn't finished until both have finished, so the slower one is the runtime and the faster one has time to spare. Here the arithmetic clock is slower by 4.6 ÷ 0.35, which is 13.</p>
+
+<p>That is the whole diagnosis for an ideal matmul, and it's good news. A perfect kernel on this problem spends its time waiting on the FP32 units, with the memory system idle for something like 92% of the run. The problem has enough arithmetic in it to keep the machine busy thirteen times over. Matmul is, by nature, <em>compute-bound</em> — a job whose limit is the arithmetic. Its opposite is a <em>memory-bound</em> job, one whose limit is the traffic, which is where you land when there isn't enough arithmetic to do per byte fetched. Adding two vectors is the classic case: two loads and a store for one add, and no amount of clever scheduling saves it.</p>
+
+<p>The quantity that decides which side you're on has a name: <em>arithmetic intensity</em>. It's the number of FLOPs you get to do for each byte you had to move from memory, and it's a property of the algorithm as written, not of the hardware. The hardware contributes one number of its own, its balance point — how many FLOPs it can do in the time it takes to move one byte:</p>
+
+<pre><code><span class="c">// the machine's balance point</span>
+<span class="n">30</span> TFLOP/s  ÷  <span class="n">768</span> GB/s   =   <span class="n">39</span> FLOPs per byte
+
+<span class="c">// what you can actually reach, given an intensity I</span>
+attainable = min( <span class="n">30</span> TFLOP/s ,  <span class="n">768</span> GB/s × I )</code></pre>
+
+<p>Thirty-nine is the number to remember. A kernel that performs more than 39 FLOPs per byte it fetches is asking more of the arithmetic than of the memory, so it's compute-bound and its ceiling is 30 TFLOP/s. A kernel below 39 is memory-bound, and its ceiling is bandwidth times intensity — for every byte per second the machine can deliver, it gets I FLOPs done. Plot both ceilings against intensity and you get the <em>roofline</em>: a sloped roof on the left where bytes are the limit, a flat roof on the right where the lanes are, and a ridge at 39 where they cross.</p>
+
+<p>Our multiply's own intensity is 137 GFLOP over 268 MB, which is 511 FLOPs per byte. That sits far to the right of the ridge, on the flat roof, at 30 TFLOP/s — the same statement as "compute-bound by 13×", drawn instead of divided.</p>
+
+<figure class="wide">
+  <div id="a-roofline"></div>
+  <figcaption><b>Figure 2.2.</b> The roofline for this card. Both axes are logarithmic. A kernel is a dot: its intensity puts it left or right, and the roof above it is the best throughput it can hope for. Kernel 1's two dots are the subject of the next section.</figcaption>
+</figure>
+
+<div class="aside">
+  <div class="t">Aside · Where the picture comes from</div>
+  <p>The roofline is the central idea of the JAX Scaling Book, and the version drawn here is a simplified one: a single chip, a single kernel, one bandwidth number and one FLOP/s number. It's honest as far as it goes. What it leaves out is mostly the caches, which is exactly where the next section runs into trouble.</p>
+</div>
+
+<h2><span class="no">2.4</span>What the naive kernel really moves</h2>
+
+<p>So a matmul <em>should</em> be compute-bound with room to spare. Kernel 1 gets 309 GFLOP/s out of 30,000. Something has clearly gone wrong, and since the arithmetic is fixed, the only thing left to get wrong is the traffic.</p>
+
+<p>Kernel 1 gives one thread to each of the 16,744,464 cells of C, and each thread runs a loop over k, and each pass through the loop loads one element of A and one element of B. That is 2 × 4,092 = 8,184 loads per thread. Across all the threads:</p>
+
+<ul>
+<li>16,744,464 threads × 8,184 loads = <b>137,036,693,376</b> loads.</li>
+<li>Each load is 4 bytes, so the kernel asks the memory system for about <b>548 GB</b>.</li>
+</ul>
+
+<p>The minimum was 268 MB. This is 2,046 times that. And the load count is worth a second look: 137,036,693,376 is the FLOP count as well, because the loop body does two loads and two FLOPs. Kernel 1 requests one 4-byte value from memory for every single floating-point operation it performs.</p>
+
+<figure class="wide">
+  <div id="a-traffic"></div>
+  <figcaption><b>Figure 2.3.</b> Where 548 GB comes from: one thread's 8,184 loads, multiplied by 16.7 million threads. The 268 MB minimum is drawn to the same scale, which is why it is a sliver and the other bar leaves the page.</figcaption>
+</figure>
+
+<p>Run that through the roofline. Kernel 1's intensity is 137 GFLOP ÷ 548 GB = 0.25 FLOPs per byte, against the 39 the machine wants — more than two decades to the left of the ridge, deep in memory-bound territory. The roof at that intensity is 768 GB/s × 0.25 = 192 GFLOP/s. A compute-bound problem has been turned into a memory-bound kernel by nothing but the order the values are asked for.</p>
+
+<p>The measurement is 309 GFLOP/s, which is above the roof, and that gap is instructive rather than embarrassing. The 548 GB is what the SMs <em>request</em>. It isn't what the DRAM delivers, because a request that hits in the 6 MB L2 cache is served there and never reaches memory. Neighboring threads in kernel 1 want overlapping data, enough of it arrives close enough together to still be resident, and the cache quietly absorbs a share of the repeats. That's why the kernel does 1.6× better than the simple roofline says.</p>
+
+<p>That gives us a rule for the rest of the book, in its honest form: caches soften the penalty for asking twice, they don't remove it. Every kernel after this one either asks fewer times or asks in a better shape, and not one of them gets to skip that work by hoping the cache will cover it. Chapter 4 takes kernel 1 apart load by load and watches those bytes move.</p>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Arithmetic clock</div><div class="v">4.6<small>ms</small></div><div class="d">137 GFLOP ÷ 30 TFLOP/s</div></div>
+  <div class="cell"><div class="l">Memory clock</div><div class="v">0.35<small>ms</small></div><div class="d">268 MB ÷ 768 GB/s</div></div>
+  <div class="cell good"><div class="l">Compute-bound by</div><div class="v">13<small>×</small></div><div class="d">the memory system idles 92% of the run</div></div>
+  <div class="cell acc"><div class="l">The ridge</div><div class="v">39<small>FLOP/B</small></div><div class="d">30 TFLOP/s ÷ 768 GB/s — above it, compute-bound</div></div>
+</div>
+
+<h2><span class="no">2.5</span>The one sentence this book is about</h2>
+
+<p>Everything in the ten kernels ahead is a variation on one move, and the two clocks are the reason it works. The arithmetic clock can't be improved, so it is not a target. The memory clock is the one every optimization goes after — not by moving bytes faster, which is fixed at 768 GB/s, but by needing fewer of them for the same 137 GFLOP.</p>
+
+<div class="key">
+  <div class="t">The sentence</div>
+  <p>Every kernel from here on does the same 137 GFLOP of arithmetic. What changes, every single time, is how many bytes have to move to feed it, and how many instructions get spent moving them. Performance is the ratio between arithmetic and traffic, and each optimization raises that ratio.</p>
+</div>
+
+<p>Here is that claim as a chart, before we've earned any of it. The bar across the top is the arithmetic, and it is the same bar in every frame. The ones underneath are the requests each kernel makes of the memory system, and they are what the next seven chapters are for.</p>
+
+<figure class="wide">
+  <div id="a-ratio"></div>
+  <figcaption><b>Figure 2.4.</b> Requests issued by the SMs, on a log scale, for the same 137 GFLOP. Each step is one idea: a scratchpad in chapter 6, then more outputs per thread in chapters 8 and 9. The 268 MB floor is the dashed line.</figcaption>
+</figure>
+
+<p>Two footnotes on that chart, because it can be read too literally. The bars count requests, not DRAM traffic — the L2 cache stands between the two and serves a good share of them, so the memory bus always sees less than what is drawn. And the last step doesn't get you to the floor: kernel 5 still asks for 4.3 GB against a minimum of 268 MB, sixteen times too much, and yet by then the traffic has stopped being the thing holding it back. Something else has taken over as the limit, which is a surprising enough turn that chapter 7 is about nothing else.</p>
+
+<p>Next, though, the machine itself: threads, warps, the three memories a kernel can put a value in, and the 32-byte unit that memory actually moves. Chapter 3 lays out the parts. Chapter 4 uses them to write the slowest kernel in the book.</p>
+
+<div class="pager"></div>
+<div class="colophon">Every number in the animations is computed, not typed in: 4.6 ms and 0.35 ms are the two divisions shown on screen, 39 FLOPs per byte is 30 TFLOP/s ÷ 768 GB/s, and 511 and 0.25 are 137 GFLOP divided by 268 MB and by 548 GB. The per-kernel request figures are 16,744,464 outputs × reads per output × 4 bytes, with reads per output taken from each kernel's structure (8,184 for kernels 1 and 2, then K/16, K/32 and K/64). The GFLOP/s measurements are Simon Boehm's on an NVIDIA A6000, from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>; the hardware figures are from the RTX A6000 datasheet.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 2.1 two clocks
+  (function () {
+    const S = MB.scene('a-clocks', { w: 900, h: 500, title: 'The arithmetic clock and the memory clock for a perfect matmul' });
+    const tl = S.tl;
+
+    // --- the two units and the bus between them
+    const sm = S.membox({ x: 300, y: 46, w: 300, h: 96, label: 'the 84 SMs', sub: '30 TFLOP/s of fp32 arithmetic', labelPos: 'top', labelSize: 13, fill: K.tealfill, stroke: K.teal, rx: 10 });
+    const lanes = S.threads({ x: 340, y: 92, n: 48, size: 10, gap: 4, perRow: 16, fill: '#bcd9d3', stroke: K.teal });
+    const pipe = S.rect({ x: 420, y: 142, w: 60, h: 104, fill: '#f5f3ec', stroke: K.rule, sw: 1, rx: 3 });
+    const pipeNote = S.text({ x: 492, y: 196, text: 'the bus', size: 11, fill: K.faint });
+    const dram = S.membox({ x: 180, y: 246, w: 540, h: 62, label: 'global memory (DRAM)', sub: '768 GB/s', labelPos: 'center', labelSize: 13, fill: K.greyfill, stroke: K.grey, rx: 10 });
+
+    // packets of bytes travelling up the bus
+    const packs = [];
+    for (let i = 0; i < 10; i++) {
+      packs.push(S.tile({ x: 432, y: 236, rows: 1, cols: 4, cell: 8, gap: 1, fill: K.grey2fill, stroke: K.grey, opacity: 0 }));
+    }
+
+    // --- clock readout
+    const clock = S.counter({ x: 40, y: 40, label: 'GPU time', value: 0, size: 26, format: v => v.toFixed(2) + ' ms' });
+    const ff = S.text({ x: 40, y: 96, text: '', font: 'mono', size: 12, fill: K.accent, weight: 600 });
+
+    // --- the two progress bars, same time axis
+    const BX = 250, BW = 420;
+    S.text({ x: 238, y: 338, text: 'arithmetic clock', anchor: 'end', size: 13, fill: K.ink, weight: 600 });
+    S.text({ x: 238, y: 354, text: '137 GFLOP ÷ 30 TFLOP/s', anchor: 'end', size: 11, fill: K.muted });
+    S.text({ x: 238, y: 396, text: 'memory clock', anchor: 'end', size: 13, fill: K.ink, weight: 600 });
+    S.text({ x: 238, y: 412, text: '268 MB ÷ 768 GB/s', anchor: 'end', size: 11, fill: K.muted });
+    S.rect({ x: BX, y: 334, w: BW, h: 22, fill: '#f3f1ea', stroke: K.rule, sw: 0.8, rx: 4 });
+    S.rect({ x: BX, y: 392, w: BW, h: 22, fill: '#f3f1ea', stroke: K.rule, sw: 0.8, rx: 4 });
+    const aBar = S.bar({ x: BX, y: 334, w: 0, h: 22, fill: K.tealfill, stroke: K.teal, value: 0, format: v => MB.fmt(v) + ' GFLOP' });
+    const mBar = S.bar({ x: BX, y: 392, w: 0, h: 22, fill: '#d9d7d0', stroke: K.grey, value: 0, format: v => MB.fmt(v) + ' MB' });
+    const mDone = S.text({ x: 735, y: 403, text: '', size: 11, fill: K.muted });
+
+    const idle = S.text({ x: BX, y: 442, text: '', size: 11.5, fill: K.muted });
+    const verdict = S.text({ x: BX, y: 466, text: '', size: 13, fill: K.accent, weight: 600 });
+    const bad = S.text({ x: BX, y: 488, text: '', size: 12.5, fill: K.red, weight: 600 });
+
+    // --- step 1
+    tl.step('Only two things can limit a kernel: how fast the lanes multiply, and how fast the bytes arrive. Time both, for a kernel that wastes nothing.');
+    tl.wait(1.8);
+
+    // --- step 2: both clocks start; memory finishes at 0.35 ms
+    tl.step('Both clocks start. The bus carries the <b>268 MB</b> that has to move at minimum — A and B read once, C read and written — and it is done at <b>0.35 ms</b>. The arithmetic is 7.6% of the way through.');
+    const t0 = tl.cursor;
+    for (let i = 0; i < 10; i++) {
+      const at = t0 + i * 0.13;
+      tl.show(packs[i], 0.1, { at: at });
+      tl.move(packs[i], 432, 150, 0.55, { at: at + 0.05 });
+      tl.to(packs[i], { opacity: 0, scale: 0.4 }, 0.2, { at: at + 0.6 });
+      tl.to(lanes.items[(i * 7) % 48], { fill: K.teal }, 0.2, { at: at + 0.6 });
+    }
+    mBar.grow(tl, BW, 268, 1.4, { at: t0, ease: 'linear' });
+    aBar.grow(tl, BW * 0.076, 10, 1.4, { at: t0, ease: 'linear' });
+    tl.to(clock.num, { value: 0.35 }, 1.4, { at: t0, ease: 'linear' });
+    tl.to(lanes.items, { fill: '#8fc0b7' }, 0.3, { at: t0 + 0.9, stagger: 0.01 });
+    tl.wait(1.5);
+
+    // --- step 3: arithmetic runs on
+    tl.step('Memory has nothing left to do. The arithmetic needs <b>4.6 ms</b> — thirteen times longer — so the bus goes quiet and the clock speeds up 5× to get us to the end.');
+    const t1 = tl.cursor;
+    tl.set(ff, { text: 'clock ×5 from here' }, t1);
+    tl.set(mDone, { text: 'done at 0.35 ms' }, t1);
+    tl.to([pipe], { fill: '#faf9f5' }, 0.4, { at: t1 });
+    aBar.grow(tl, BW, 137, 3.4, { at: t1, ease: 'linear' });
+    tl.to(clock.num, { value: 4.6 }, 3.4, { at: t1, ease: 'linear' });
+    tl.to(lanes.items, { fill: K.teal }, 0.5, { at: t1 + 0.2, stagger: 0.03 });
+    tl.set(idle, { text: 'the memory system sits idle for the other 4.25 ms' }, t1 + 1.2);
+    tl.wait(1.4);
+
+    // --- step 4
+    tl.step('So matmul is <b>compute-bound by 13×</b>. A perfect kernel spends its time waiting on the FP32 units, with the memory system idle 92% of the run. That is the good news.');
+    tl.set(ff, { text: '' });
+    tl.set(verdict, { text: '4.6 ms ÷ 0.35 ms = 13 × more arithmetic time than memory time' });
+    tl.wait(2.4);
+
+    // --- step 5
+    tl.step('The bad news: kernel 1 does not move 268 MB. It asks the memory system for <b>548 GB</b>, and that is the next animation.');
+    tl.set(bad, { text: 'kernel 1 requests 548 GB — 2,046 × the minimum' });
+    tl.wait(2.8);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 2.2 the roofline
+  (function () {
+    const S = MB.scene('a-roofline', { w: 900, h: 520, title: 'The roofline: attainable throughput against arithmetic intensity' });
+    const tl = S.tl;
+
+    // log-log plot frame
+    const PX0 = 110, PW = 720, LX0 = -1.3, LX1 = 3.3;         // x: FLOPs per byte
+    const PYB = 420, PH = 350, LY0 = -1.3, LY1 = 2.0;         // y: TFLOP/s
+    const X = v => PX0 + (Math.log(v) / Math.LN10 - LX0) / (LX1 - LX0) * PW;
+    const Y = v => PYB - (Math.log(v) / Math.LN10 - LY0) / (LY1 - LY0) * PH;
+    const PYT = 70;
+
+    S.text({ x: PX0, y: 44, text: 'attainable fp32 throughput — TFLOP/s', size: 12, fill: K.muted });
+    S.line({ x1: PX0, y1: PYT - 12, x2: PX0, y2: PYB, stroke: K.ink, sw: 1 });
+    S.line({ x1: PX0, y1: PYB, x2: PX0 + PW, y2: PYB, stroke: K.ink, sw: 1 });
+    [0.1, 1, 10, 100, 1000].forEach(v => {
+      S.line({ x1: X(v), y1: PYT, x2: X(v), y2: PYB, stroke: K.rule, sw: 0.6 });
+      S.line({ x1: X(v), y1: PYB, x2: X(v), y2: PYB + 5, stroke: K.ink, sw: 1 });
+      S.text({ x: X(v), y: PYB + 18, text: MB.fmt(v, 1).replace('.0', ''), anchor: 'middle', size: 11, fill: K.muted });
+    });
+    [0.1, 1, 10, 100].forEach(v => {
+      S.line({ x1: PX0, y1: Y(v), x2: PX0 + PW, y2: Y(v), stroke: K.rule, sw: 0.6 });
+      S.line({ x1: PX0 - 5, y1: Y(v), x2: PX0, y2: Y(v), stroke: K.ink, sw: 1 });
+      S.text({ x: PX0 - 10, y: Y(v), text: MB.fmt(v, 1).replace('.0', ''), anchor: 'end', size: 11, fill: K.muted });
+    });
+    S.text({ x: PX0 + PW / 2, y: 462, text: 'arithmetic intensity — FLOPs performed per byte moved from memory', anchor: 'middle', size: 12, fill: K.muted });
+
+    // the memory roof: y = 0.768 * x  (TFLOP/s), drawn from the bottom axis to the ridge
+    const mx0 = X(Math.pow(10, LY0) / 0.768), my0 = PYB;
+    const roofM = S.line({ x1: mx0, y1: my0, x2: mx0, y2: my0, stroke: K.grey, sw: 2.4 });
+    const mLbl1 = S.text({ x: 140, y: 196, text: 'the memory roof', size: 12.5, fill: K.grey, weight: 600, opacity: 0 });
+    const mLbl2 = S.text({ x: 140, y: 213, text: '768 GB/s × intensity', size: 11.5, fill: K.grey, opacity: 0 });
+    const mArr = S.arrow({ x1: -60, y1: -60, x2: -40, y2: -60, stroke: K.grey, sw: 1.1, opacity: 0, display: 'none' });
+
+    // the compute roof: flat at 30 TFLOP/s
+    const roofC = S.line({ x1: X(39), y1: Y(30), x2: X(39), y2: Y(30), stroke: K.teal, sw: 2.4 });
+    const cLbl = S.text({ x: 566, y: 110, text: 'the compute roof — 30 TFLOP/s', size: 12.5, fill: K.teal, weight: 600, opacity: 0 });
+
+    // the ridge
+    const ridgeLine = S.line({ x1: X(39), y1: Y(30), x2: X(39), y2: PYB, stroke: K.accent, sw: 1.2, dash: '5 4', opacity: 0 });
+    const ridgeDot = S.circle({ cx: X(39), cy: Y(30), r: 5, fill: K.accent, opacity: 0 });
+    const rLbl1 = S.text({ x: 572, y: 330, text: 'the ridge — 39 FLOPs per byte', size: 12.5, fill: K.accent, weight: 600, opacity: 0 });
+    const rLbl2 = S.text({ x: 572, y: 347, text: '30 TFLOP/s ÷ 768 GB/s', size: 11.5, fill: K.muted, opacity: 0 });
+    const rLbl3 = S.text({ x: 572, y: 364, text: 'left: memory-bound   ·   right: compute-bound', size: 11.5, fill: K.muted, opacity: 0 });
+
+    // matmul's intrinsic point
+    const mmDot = S.circle({ cx: X(511), cy: Y(30), r: 6.5, fill: K.teal, opacity: 0 });
+    const mm1 = S.text({ x: X(511), y: 150, text: 'a perfect matmul sits here', anchor: 'middle', size: 12.5, fill: K.teal, weight: 600, opacity: 0 });
+    const mm2 = S.text({ x: X(511), y: 167, text: '511 FLOPs per byte', anchor: 'middle', size: 11.5, fill: K.muted, opacity: 0 });
+
+    // kernel 1
+    const k1Roof = S.circle({ cx: X(0.25), cy: Y(0.192), r: 6, fill: K.white, stroke: K.red, sw: 2, opacity: 0 });
+    const k1Meas = S.circle({ cx: X(0.25), cy: Y(0.309), r: 6, fill: K.red, opacity: 0 });
+    const k1Arr = S.arrow({ x1: -60, y1: -60, x2: -40, y2: -60, stroke: K.red, sw: 1.1, opacity: 0, display: 'none' });
+    const k1a = S.text({ x: 330, y: 372, text: 'kernel 1 — 0.25 FLOPs per byte', size: 12.5, fill: K.red, weight: 600, opacity: 0 });
+    const k1b = S.text({ x: 330, y: 389, text: 'roofline: 768 GB/s × 0.25 = 192 GFLOP/s', size: 11.5, fill: K.muted, opacity: 0 });
+    const k1c = S.text({ x: 330, y: 406, text: 'measured: 309 GFLOP/s — the L2 cache', size: 11.5, fill: K.muted, opacity: 0 });
+
+    // the sweep: every kernel pushes its dot right
+    const sweep = S.path({ d: 'M-60,-60 L-40,-60', stroke: K.accent, sw: 1.6, dash: '6 5', arrow: true, opacity: 0, display: 'none' });
+
+    tl.step('Two axes. Across: <b>arithmetic intensity</b>, the FLOPs a kernel performs per byte it moves. Up: the throughput it can attain. If bytes are the limit, that throughput is bandwidth × intensity — the sloped <b>memory roof</b>.');
+    tl.to(roofM, { x2: X(39), y2: Y(30) }, 1.2);
+    tl.set(mArr, { display: 'inline', x1: 246, y1: 222, x2: 296, y2: 296 }, '<+0.5');
+    tl.show([mLbl1, mLbl2, mArr], 0.4, { at: '<' });
+    tl.wait(1.8);
+
+    tl.step('The lanes put a second ceiling on top: no arrangement of anything exceeds <b>30 TFLOP/s</b>, however many FLOPs you get per byte. That is the flat <b>compute roof</b>.');
+    tl.to(roofC, { x2: X(2000), y2: Y(30) }, 1.0);
+    tl.show(cLbl, 0.4, { at: '<+0.3' });
+    tl.wait(1.8);
+
+    tl.step('They cross at the machine’s balance point: <b>30 TFLOP/s ÷ 768 GB/s = 39 FLOPs per byte</b>. Left of that ridge a kernel is memory-bound; right of it, compute-bound.');
+    tl.show([ridgeLine, ridgeDot], 0.5);
+    tl.show([rLbl1, rLbl2, rLbl3], 0.4, { at: '<+0.2', stagger: 0.12 });
+    tl.wait(2.0);
+
+    tl.step('Where does our multiply sit? 137 GFLOP over the 268 MB it has to move is <b>511 FLOPs per byte</b> — far to the right, on the flat roof. Compute-bound, with room to spare.');
+    tl.show(mmDot, 0.4);
+    tl.pulse(mmDot, 1.6, 0.7);
+    tl.show([mm1, mm2], 0.4, { at: '<' });
+    tl.wait(2.2);
+
+    tl.step('And kernel 1 sits <b>here</b>: 137 GFLOP over 548 GB is 0.25 FLOPs per byte. The roof at that intensity is 192 GFLOP/s (hollow dot). It measures <b>309</b> — the L2 cache serving some of the repeats.');
+    tl.show(k1Roof, 0.4);
+    tl.set(k1Arr, { display: 'inline', x1: 324, y1: 374, x2: 240, y2: 350 }, '<+0.2');
+    tl.show([k1Arr, k1a, k1b], 0.4, { at: '<' });
+    tl.wait(1.2);
+    tl.show(k1Meas, 0.4);
+    tl.show(k1c, 0.4, { at: '<' });
+    tl.wait(2.0);
+
+    tl.step('Every kernel in this book moves its dot to the right: same 137 GFLOP, fewer bytes. Chapter 14 comes back to this chart with all ten of them on it.');
+    tl.set(sweep, { display: 'inline', d: 'M232,352 Q500,340 648,168' });
+    tl.show(sweep, 0.8, { at: '<' });
+    tl.wait(2.8);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 2.3 what kernel 1 moves
+  (function () {
+    const S = MB.scene('a-traffic', { w: 900, h: 490, title: 'The 548 GB kernel 1 requests from the memory system' });
+    const tl = S.tl;
+
+    const cell = 12, GX = 70, GY = 90;
+    const C = S.matrix({ x: GX, y: GY, rows: 16, cols: 16, cell, label: 'C — one thread per output', labelSize: 12, fill: K.Cfill, stroke: '#e0b98f', sw: 0.5, opacity: 0 });
+    const note1 = S.text({ x: GX, y: 302, text: 'drawn 16 × 16; the real C is 4,092 × 4,092', size: 10.5, fill: K.muted, opacity: 0 });
+    const note2 = S.text({ x: GX, y: 318, text: '16,744,464 threads, one per cell', size: 10.5, fill: K.muted, opacity: 0 });
+
+    const head = S.text({ x: 330, y: 78, text: 'what one of those threads reads', size: 12.5, fill: K.ink, weight: 600, opacity: 0 });
+    const Arow = S.matrix({ x: 330, y: 104, rows: 1, cols: 20, cell: 10, fill: K.Afill, stroke: K.A, sw: 0.6, opacity: 0 });
+    const aLbl = S.text({ x: 330, y: 92, text: 'a whole row of A', size: 11, fill: K.A, weight: 600, opacity: 0 });
+    const aEll = S.text({ x: 538, y: 109, text: '… 4,092 values', size: 9.5, fill: K.faint, opacity: 0 });
+    const Bcol = S.matrix({ x: 660, y: 104, rows: 20, cols: 1, cell: 10, fill: K.Bfill, stroke: K.B, sw: 0.6, opacity: 0 });
+    const bLbl = S.text({ x: 676, y: 109, text: 'a whole column of B', size: 11, fill: K.B, weight: 600, opacity: 0 });
+    const bEll = S.text({ x: 676, y: 126, text: '… 4,092 values', size: 9.5, fill: K.faint, opacity: 0 });
+
+    const perThread = S.counter({ x: 330, y: 150, label: 'loads for this one thread', value: 0, size: 24, fill: K.ink, opacity: 0 });
+    const perNote = S.text({ x: 330, y: 196, text: '2 loads per k-step × 4,092 steps', size: 11.5, fill: K.muted, opacity: 0 });
+
+    const mul1 = S.text({ x: 330, y: 236, text: '16,744,464 threads × 8,184 loads × 4 bytes', font: 'mono', size: 12.5, fill: K.ink, opacity: 0 });
+    const mul2 = S.text({ x: 330, y: 258, text: '= 548,146,773,504 bytes', font: 'mono', size: 12.5, fill: K.red, opacity: 0 });
+    const total = S.counter({ x: 830, y: 232, label: 'requested from memory', value: 0, size: 26, anchor: 'end', fill: K.red, opacity: 0, format: v => (v / 1e9).toFixed(1) + ' GB' });
+
+    const lblMin = S.text({ x: 310, y: 356, text: 'the minimum', anchor: 'end', size: 12.5, fill: K.ink, weight: 600, opacity: 0 });
+    const lblK1 = S.text({ x: 310, y: 400, text: 'kernel 1 asks for', anchor: 'end', size: 12.5, fill: K.ink, weight: 600, opacity: 0 });
+    const minBar = S.bar({ x: 320, y: 346, w: 0, h: 18, fill: K.Cfill, stroke: K.C, value: 0, format: v => MB.fmt(v) + ' MB', opacity: 0 });
+    const k1Bar = S.bar({ x: 320, y: 390, w: 0, h: 18, fill: K.redfill, stroke: K.red, value: 0, opacity: 0 });
+    k1Bar.value.setNow({ opacity: 0 });
+    const k1Val = S.text({ x: 330, y: 400, text: '548 GB', size: 13, fill: K.red, weight: 600, opacity: 0 });
+    const k1Off = S.arrow({ x1: -60, y1: -60, x2: -40, y2: -60, stroke: K.red, sw: 2, opacity: 0, display: 'none' });
+    const ratio = S.text({ x: 786, y: 378, text: '× 2,046 the minimum', anchor: 'end', size: 12, fill: K.red, weight: 600, opacity: 0 });
+
+    const verdict = S.text({ x: GX, y: 442, text: '', size: 13, fill: K.accent, weight: 600 });
+    const l2 = S.text({ x: GX, y: 464, text: '', size: 11.5, fill: K.muted });
+
+    tl.step('C has <b>16,744,464</b> cells and kernel 1 gives every one of them its own thread. The grid here is 16 × 16 and stands for all of them.');
+    tl.show(C, 0.6);
+    tl.show([note1, note2], 0.4, { at: '<+0.3', stagger: 0.1 });
+    tl.wait(1.6);
+
+    tl.step('Take one thread. To finish its one output it reads <b>a whole row of A</b> and <b>a whole column of B</b>: two loads on every one of the 4,092 passes through the loop, <b>8,184</b> loads in all.');
+    tl.to(C.cellAt(6, 9), { fill: K.Cdeep, stroke: K.Cdeep, sw: 1.4 }, 0.4);
+    tl.show([head, aLbl, Arow, aEll], 0.4, { at: '<+0.2', stagger: 0.08 });
+    tl.show([bLbl, Bcol, bEll], 0.4, { stagger: 0.08 });
+    tl.show(perThread, 0.4);
+    tl.to(perThread.num, { value: 8184 }, 1.0, { at: '<', ease: 'linear' });
+    tl.show(perNote, 0.4, { at: '<+0.5' });
+    tl.wait(1.8);
+
+    tl.step('Every thread does that. <b>16,744,464 × 8,184 × 4 bytes = 548 GB</b> requested from the memory system — and 137,036,693,376 loads is also the FLOP count, so kernel 1 asks for one value per operation.');
+    tl.show([mul1, total], 0.4);
+    tl.to(total.num, { value: 548146773504 }, 2.0, { at: '<', ease: 'linear' });
+    tl.show(mul2, 0.4, { at: '<+1.6' });
+    tl.wait(1.8);
+
+    tl.step('The minimum was <b>268 MB</b>. Drawn to the same scale it is that sliver, and kernel 1’s bar leaves the page: <b>2,046 ×</b> more traffic for exactly the same arithmetic.');
+    tl.show([lblMin, minBar], 0.3);
+    minBar.grow(tl, 8, 268, 0.5, { at: '<' });
+    tl.show([lblK1, k1Bar], 0.3);
+    k1Bar.grow(tl, 470, 548, 1.4, { at: '<', ease: 'linear' });
+    tl.show(k1Val, 0.3, { at: '<+1.0' });
+    tl.set(k1Off, { display: 'inline', x1: 796, y1: 399, x2: 856, y2: 399 });
+    tl.show([k1Off, ratio], 0.4, { at: '<' });
+    tl.set(verdict, { text: '137 GFLOP ÷ 548 GB = 0.25 FLOPs per byte — the machine needs 39' }, '<');
+    tl.wait(2.2);
+
+    tl.step('That is how a compute-bound problem becomes a memory-bound kernel. The L2 cache saves some of it, which is why kernel 1 reaches 309 GFLOP/s and not the 192 the roofline predicts. Caches soften the penalty; they don’t remove it.');
+    tl.set(l2, { text: 'requests, not DRAM traffic: the 6 MB L2 serves a share of the repeats — 309 GFLOP/s measured against 192 predicted' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 2.4 the one sentence
+  (function () {
+    const S = MB.scene('a-ratio', { w: 900, h: 400, title: 'The same arithmetic, falling memory requests, kernel by kernel' });
+    const tl = S.tl;
+
+    const AX = 200, AW = 630;                                  // log axis: 100 MB … 1 TB
+    const X = v => AX + (Math.log(v) / Math.LN10 - 8) / 4 * AW;
+
+    // the arithmetic bar — never changes
+    S.text({ x: 190, y: 71, text: 'arithmetic', anchor: 'end', size: 12.5, fill: K.ink, weight: 600 });
+    const aBox = S.rect({ x: AX, y: 60, w: AW, h: 22, fill: K.tealfill, stroke: K.teal, sw: 1, rx: 3, opacity: 0 });
+    const aTxt = S.text({ x: AX + AW / 2, y: 71.5, text: '137 GFLOP — the same for every kernel', anchor: 'middle', size: 12.5, fill: K.teal, weight: 600, opacity: 0 });
+    S.line({ x1: 40, y1: 100, x2: 860, y2: 100, stroke: K.rule, sw: 1 });
+
+    // axis
+    const AY = 298;
+    S.line({ x1: AX, y1: AY, x2: AX + AW, y2: AY, stroke: K.ink, sw: 1 });
+    [[1e8, '100 MB'], [1e9, '1 GB'], [1e10, '10 GB'], [1e11, '100 GB'], [1e12, '1 TB']].forEach(t => {
+      S.line({ x1: X(t[0]), y1: 118, x2: X(t[0]), y2: AY, stroke: K.rule, sw: 0.6 });
+      S.line({ x1: X(t[0]), y1: AY, x2: X(t[0]), y2: AY + 5, stroke: K.ink, sw: 1 });
+      S.text({ x: X(t[0]), y: AY + 18, text: t[1], anchor: 'middle', size: 11, fill: K.muted });
+    });
+    S.text({ x: AX + AW / 2, y: AY + 40, text: 'bytes the SMs request from the memory system — log scale', anchor: 'middle', size: 12, fill: K.muted });
+
+    const rows = [
+      { y: 126, v: 548e9, fill: K.redfill, stroke: K.red, lbl: 'kernels 1 and 2', sub: '8,184 reads per output', fmt: v => MB.fmt(v / 1e9) + ' GB' },
+      { y: 160, v: 17.1e9, fill: K.purplefill, stroke: K.purple, lbl: 'kernel 3', sub: 'shared memory', fmt: v => (v / 1e9).toFixed(1) + ' GB' },
+      { y: 194, v: 8.6e9, fill: K.goldfill, stroke: K.gold, lbl: 'kernel 4', sub: '1D blocktiling', fmt: v => (v / 1e9).toFixed(1) + ' GB' },
+      { y: 228, v: 4.3e9, fill: K.goldfill, stroke: K.gold, lbl: 'kernel 5', sub: '2D blocktiling', fmt: v => (v / 1e9).toFixed(1) + ' GB' },
+      { y: 262, v: 268e6, fill: K.Cfill, stroke: K.C, lbl: 'the floor', sub: 'each matrix once', fmt: v => MB.fmt(v / 1e6) + ' MB' },
+    ];
+    rows.forEach(r => {
+      r.name = S.text({ x: 190, y: r.y + 7, text: r.lbl, anchor: 'end', size: 12.5, fill: K.ink, weight: 600, opacity: 0 });
+      r.note = S.text({ x: 190, y: r.y + 21, text: r.sub, anchor: 'end', size: 10.5, fill: K.muted, opacity: 0 });
+      r.bar = S.bar({ x: AX, y: r.y, w: 0, h: 20, fill: r.fill, stroke: r.stroke, value: 0, format: r.fmt, opacity: 0 });
+    });
+    const floorLine = S.line({ x1: X(268e6), y1: 118, x2: X(268e6), y2: 292, stroke: K.C, sw: 1.2, dash: '5 4', opacity: 0 });
+    const closing = S.text({ x: 40, y: 372, text: '', size: 12.5, fill: K.accent, weight: 600 });
+
+    function showRow(r, dur) {
+      tl.show([r.name, r.note, r.bar], 0.3);
+      r.bar.grow(tl, X(r.v) - AX, r.v, dur, { at: '<', ease: 'out' });
+    }
+
+    tl.step('Start with the part that never moves. Every kernel in this book performs the same <b>137 GFLOP</b> of arithmetic — same multiplies, same adds, same order of magnitude of work.');
+    tl.show([aBox, aTxt], 0.5);
+    tl.wait(1.8);
+
+    tl.step('What changes is underneath. <b>Kernels 1 and 2</b> ask the memory system for <b>548 GB</b>: every thread reads a full row and a full column, 8,184 values per output.');
+    showRow(rows[0], 1.2);
+    tl.wait(1.8);
+
+    tl.step('<b>Kernel 3</b> stages a tile of A and B in <b>shared memory</b> so a block reads each value once and re-uses it 32 times: 256 reads per output, <b>17.1 GB</b>.');
+    showRow(rows[1], 1.0);
+    tl.wait(1.8);
+
+    tl.step('<b>Kernel 4</b> gives each thread eight outputs in a column — <b>1D blocktiling</b> — so one value of B serves eight multiply-adds: 128 reads per output, <b>8.6 GB</b>.');
+    showRow(rows[2], 1.0);
+    tl.wait(1.8);
+
+    tl.step('<b>Kernel 5</b> gives each thread an 8 × 8 patch — <b>2D blocktiling</b> — and sixteen loaded values feed sixty-four multiply-adds: 64 reads per output, <b>4.3 GB</b>.');
+    showRow(rows[3], 1.0);
+    tl.wait(1.8);
+
+    tl.step('The floor is <b>268 MB</b>. Kernel 5 is still 16× above it in requests — but the L2 serves most of them, and by then the limit is something else entirely (chapter 7). <b>The arithmetic never changed; only the traffic did.</b>');
+    showRow(rows[4], 0.8);
+    tl.show(floorLine, 0.4, { at: '<' });
+    tl.set(closing, { text: 'same 137 GFLOP · 548 GB of requests down to 4.3 GB · performance is the ratio between the two' }, '<');
+    tl.wait(3.0);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

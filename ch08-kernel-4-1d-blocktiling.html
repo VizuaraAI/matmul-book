@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel 4: 1D blocktiling · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 8 · <em>The instruction-starved kernels</em></div>
+<h1>Kernel 4: 1D blocktiling</h1>
+<p class="lede">Give each thread eight outputs in a column, and one loaded B value serves all eight. Nine loads for eight multiply-adds, and the lanes start getting fed.</p>
+<div class="byline">Kernel · <em>sgemm1DBlocktiling</em> · 8,475 GFLOP/s · 36.5% of cuBLAS · measured by Simon Boehm on an NVIDIA A6000</div>
+
+<p>Chapter 7 left us with a precise target: get below two shared-memory loads per multiply-add. So ask the question that solves it. <em>When can one load serve more than one multiply-add?</em> Only when two multiply-adds want the same number. So look at the definition of the output and find where operands repeat.</p>
+
+<pre><code>C[i][j]  =  sum over k of  A[i][k] × B[k][j]</code></pre>
+
+<h2><span class="no">8.1</span>Where operands repeat</h2>
+
+<p>Take two outputs in the same column, C[i][j] and C[i+1][j]. At step k the first needs A[i][k] × B[k][j] and the second needs A[i+1][k] × B[k][j]. Two different values of A, but the <em>same</em> value of B. Take two outputs in the same row instead, C[i][j] and C[i][j+1], and it is the other way round: the same A value, two different B values. Here it is on the 8 × 8 example.</p>
+
+<figure class="wide">
+  <div id="a-repeat"></div>
+  <figcaption><b>Figure 8.1.</b> The observation the next two kernels are built on. Outputs stacked vertically share their B operand at every step of k; outputs side by side share their A operand. A thread that owns only one output can exploit neither.</figcaption>
+</figure>
+
+<p>Kernel 3's thread owns one output, so at each step it loads one A value and one B value and uses each exactly once. Nothing repeats inside a single thread, and so nothing can be reused. The way to reuse a loaded value is to give one thread several outputs that share it.</p>
+
+<h2><span class="no">8.2</span>Give one thread a column of eight</h2>
+
+<p>Kernel 4 gives each thread a column of eight outputs, C[i .. i+7][j]. At each step of the inner loop the thread needs eight different values of A, one per row, and one value of B, which it loads once into a register and reuses eight times. Here is Boehm's inner loop; TM is 8.</p>
+
+<pre><code><span class="k">float</span> threadResults[TM] = {<span class="n">0.0</span>};          <span class="c">// 8 running totals, in registers</span>
+
+<span class="k">for</span> (<span class="k">uint</span> dotIdx = <span class="n">0</span>; dotIdx &lt; BK; ++dotIdx) {
+  <span class="k">float</span> tmpB = Bs[dotIdx * BN + threadCol];  <span class="c">// ONE load of B …</span>
+  <span class="k">for</span> (<span class="k">uint</span> resIdx = <span class="n">0</span>; resIdx &lt; TM; ++resIdx)   <span class="c">// … reused 8 times</span>
+    threadResults[resIdx] +=
+        As[(threadRow * TM + resIdx) * BK + dotIdx] * tmpB;
+}</code></pre>
+
+<figure class="wide">
+  <div id="a-column"></div>
+  <figcaption><b>Figure 8.2.</b> One thread of kernel 4 computing its column of eight, with real numbers. Every step of k costs one B load and eight A loads and produces eight multiply-adds, each landing in its own accumulator. After eight steps the accumulators hold column 5 of C exactly.</figcaption>
+</figure>
+
+<p>The count: eight loads from As, one from Bs, nine in total, producing eight multiply-adds. That is 1.125 loads per FMA, down from 2.000. Put the other way, the instruction mix flips from two loads for every FFMA to nine loads for every eight FFMAs, so nearly half of what the scheduler issues is now arithmetic instead of a third. And there is a quieter gain riding along: the eight accumulators are independent of each other, so the scheduler can keep several multiply-adds in flight at once, which chapter 7 showed one accumulator could never do.</p>
+
+<h2><span class="no">8.3</span>The block reshapes to match</h2>
+
+<p>If every thread now owns eight outputs, a block of the old 1,024 threads would cover 8,192 outputs, and the shared-memory tile that many outputs need would be awkward. Boehm's kernel 4 uses a 64 × 64 tile of C with BK = 8, and the numbers work out neatly.</p>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Threads per block</div><div class="v">512</div><div class="d">64 × 64 outputs ÷ 8 per thread</div></div>
+  <div class="cell"><div class="l">Shared memory per chunk</div><div class="v">4<small>KB</small></div><div class="d">As 64 × 8 + Bs 8 × 64 floats</div></div>
+  <div class="cell"><div class="l">Copies per thread per chunk</div><div class="v">1 + 1</div><div class="d">512 elements each ÷ 512 threads</div></div>
+  <div class="cell good"><div class="l">Global reads per output</div><div class="v">K/32</div><div class="d">down from K/16 in kernel 3</div></div>
+</div>
+
+<figure class="wide">
+  <div id="a-block"></div>
+  <figcaption><b>Figure 8.3.</b> Kernel 4's 64 × 64 block tile as 512 columns of eight, one per thread, and the 4 KB chunk in shared memory that feeds it. Each thread still copies exactly one element of A and one of B per chunk, coalesced.</figcaption>
+</figure>
+
+<p>And because the block tile grew from 32 × 32 to 64 × 64, the global-memory traffic improves as well, independently of everything above: reads per output fall from K/16 to K/32. A bigger tile means more reuse of each value fetched from DRAM, which is the same lever kernel 3 pulled. So kernel 4 changes two things at once, a taller <em>thread</em> tile that cuts the shared-memory traffic and a wider <em>block</em> tile that cuts the DRAM traffic, and it is worth keeping the two apart when reading the measurement.</p>
+
+<h2><span class="no">8.4</span>Predict, then measure</h2>
+
+<p>If shared-memory loads were the only thing that mattered, the ratio alone would predict a speedup of 2 ÷ 1.125 = 1.78×. Measured: 2,980 → 8,475 GFLOP/s, a 2.84× step. The rest comes from the two other changes: the halved DRAM traffic, and those eight independent accumulators giving the scheduler something to overlap.</p>
+
+<figure class="wide">
+  <div id="a-predict"></div>
+  <figcaption><b>Figure 8.4.</b> What the load ratio predicts against what Boehm measured. The gap is not error; it is the two other levers kernel 4 pulled at the same time.</figcaption>
+</figure>
+
+<div class="key">
+  <div class="t">What kernel 4 taught</div>
+  <p>Once a loaded number is in a register, reusing it costs nothing. The only question is how to arrange the work so that one thread holds several outputs that want the same number. Kernel 4 arranged it in one direction, along a column, and used the B sharing. It left the A sharing on the table.</p>
+</div>
+
+<p>Which makes the next move obvious. If stretching a thread's territory in one direction helped this much, what happens if we stretch it in two? That is kernel 5, and it is the chapter with the picture to keep.</p>
+
+<div class="pager"></div>
+<div class="colophon">The column animation multiplies the shared 8 × 8 example live and checks its eight accumulators against MB.C8 in the page's own script. Tile sizes are Boehm's kernel 4 settings (BM = BN = 64, BK = 8, TM = 8, 512 threads); the per-output read counts and the 2,980 → 8,475 GFLOP/s measurement are his, from the <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+  const A8 = MB.A8, B8 = MB.B8, C8 = MB.C8;
+
+  // ------------------------------------------------------------ 8.1 where operands repeat
+  (function () {
+    const S = MB.scene('a-repeat', { w: 900, h: 440, title: 'Where operands repeat between neighboring outputs' });
+    const tl = S.tl, cell = 26;
+    const A = S.matrix({ x: 60, y: 60, rows: 8, cols: 8, cell, values: A8, label: 'A', labelSize: 15 });
+    const B = S.matrix({ x: 330, y: 60, rows: 8, cols: 8, cell, values: B8, label: 'B', labelSize: 15 });
+    const C = S.matrix({ x: 600, y: 60, rows: 8, cols: 8, cell, label: 'C', labelSize: 15 });
+    const d = 3;
+    const kLbl = S.text({ x: 450, y: 30, text: 'at step k = ' + d, anchor: 'middle', size: 13, fill: K.ink, weight: 600, font: 'mono', opacity: 0 });
+    const eq1 = S.text({ x: 60, y: 310, text: '', font: 'mono', size: 12.5, fill: K.ink });
+    const eq2 = S.text({ x: 60, y: 332, text: '', font: 'mono', size: 12.5, fill: K.ink });
+    const note = S.text({ x: 60, y: 372, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 60, y: 392, text: '', size: 12, fill: K.muted });
+    const ring = (r, c, color) => S.rect({ x: 600 + c * cell - 2, y: 60 + r * cell - 2, w: cell + 4, h: cell + 4, fill: 'none', stroke: color, sw: 2, rx: 3, opacity: 0 });
+    const rA = ring(2, 5, K.C), rB = ring(3, 5, K.C), rC = ring(2, 6, K.C);
+
+    tl.step('Two outputs stacked in a column, <b>C[2][5]</b> and <b>C[3][5]</b>. At step k = 3 the first needs A[2][3] × B[3][5] and the second needs A[3][3] × B[3][5].');
+    tl.show(kLbl, 0.3);
+    tl.show([rA, rB], 0.3, { at: '<' });
+    tl.to([C.cellAt(2, 5), C.cellAt(3, 5)], { fill: K.Cfill }, 0.3, { at: '<' });
+    tl.to([A.cellAt(2, d), A.cellAt(3, d)], { fill: K.Afill, stroke: K.A, sw: 1.4 }, 0.3);
+    tl.to(B.cellAt(d, 5), { fill: K.Bfill, stroke: K.B, sw: 1.6 }, 0.3, { at: '<' });
+    tl.set(eq1, { text: `C[2][5] += A[2][3] × B[3][5]  =  ${A8[2][d]} × ${B8[d][5]}` });
+    tl.set(eq2, { text: `C[3][5] += A[3][3] × B[3][5]  =  ${A8[3][d]} × ${B8[d][5]}` }, '<');
+    tl.wait(1.8);
+    tl.step('Two different values of A, but the <b>same value of B</b>. Outputs stacked vertically share their B operand, at every step of k.');
+    tl.pulse(B.cellAt(d, 5), 1, 0.01); // no-op keeps cursor semantics simple
+    tl.to(B.cellAt(d, 5), { fill: '#a7dfbb' }, 0.3);
+    tl.set(note, { text: 'same column  ⇒  same B[k][j]  —  one load of B could serve both multiply-adds' });
+    tl.wait(1.8);
+
+    tl.step('Now two outputs side by side, <b>C[2][5]</b> and <b>C[2][6]</b>. They need A[2][3] × B[3][5] and A[2][3] × B[3][6]: the <b>same value of A</b>, two different values of B.');
+    tl.hide(rB, 0.2); tl.to(C.cellAt(3, 5), { fill: '#fff' }, 0.2, { at: '<' });
+    tl.to(A.cellAt(3, d), { fill: '#fff', stroke: '#c9c4bb', sw: 0.7 }, 0.2, { at: '<' });
+    tl.to(B.cellAt(d, 5), { fill: K.Bfill }, 0.2, { at: '<' });
+    tl.show(rC, 0.3); tl.to(C.cellAt(2, 6), { fill: K.Cfill }, 0.3, { at: '<' });
+    tl.to(B.cellAt(d, 6), { fill: K.Bfill, stroke: K.B, sw: 1.6 }, 0.3, { at: '<' });
+    tl.to(A.cellAt(2, d), { fill: '#a9c6f5' }, 0.3, { at: '<' });
+    tl.set(eq1, { text: `C[2][5] += A[2][3] × B[3][5]  =  ${A8[2][d]} × ${B8[d][5]}` });
+    tl.set(eq2, { text: `C[2][6] += A[2][3] × B[3][6]  =  ${A8[2][d]} × ${B8[d][6]}` }, '<');
+    tl.set(note, { text: 'same row  ⇒  same A[i][k]  —  one load of A could serve both multiply-adds' }, '<');
+    tl.wait(2.0);
+
+    tl.step('A thread that owns <b>one</b> output can use neither sharing: it loads one A and one B and uses each once. A thread that owns several outputs can. Kernel 4 uses the first sharing; kernel 5 will use both.');
+    tl.set(note2, { text: 'kernel 4: one thread, eight outputs in a column → one B load serves eight FMAs' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 8.2 one thread, a column of eight
+  (function () {
+    const S = MB.scene('a-column', { w: 900, h: 500, title: 'One thread of kernel 4: a column of eight outputs' });
+    const tl = S.tl, cell = 24;
+    const col = 5;
+    const A = S.matrix({ x: 40, y: 70, rows: 8, cols: 8, cell, values: A8, label: 'As — the thread’s 8 rows', labelSize: 12, valueSize: 10.5 });
+    const B = S.matrix({ x: 280, y: 70, rows: 8, cols: 8, cell, values: B8, label: 'Bs — column 5 is the thread’s', labelSize: 12, valueSize: 10.5 });
+    const tmpB = S.matrix({ x: 540, y: 34, rows: 1, cols: 1, cell: 30, values: [[0]], fill: K.goldfill, stroke: K.gold, sw: 1.2, label: 'tmpB', labelSize: 12, labelPos: 'left', valueSize: 13, opacity: 0 });
+    const R = S.matrix({ x: 540, y: 70, rows: 8, cols: 1, cell: 30, values: C8.map(() => [0]), fill: K.goldfill, stroke: K.gold, sw: 1.2, label: 'threadResults[8]', labelSize: 11, labelPos: 'bottom', valueSize: 12, opacity: 0 });
+    const C = S.matrix({ x: 660, y: 70, rows: 8, cols: 8, cell, label: 'C', labelSize: 12 });
+    C.col(col).forEach(c => c.setNow({ fill: K.Cfill, stroke: K.C, sw: 1 }));
+    const kLbl = S.text({ x: 40, y: 34, text: '', size: 13, fill: K.ink, weight: 600, font: 'mono' });
+    const ld = S.counter({ x: 40, y: 350, label: 'loads this step', value: 0, size: 20 });
+    const fm = S.counter({ x: 190, y: 350, label: 'FMAs this step', value: 0, size: 20 });
+    const ldT = S.counter({ x: 340, y: 350, label: 'loads so far', value: 0, size: 20 });
+    const fmT = S.counter({ x: 470, y: 350, label: 'FMAs so far', value: 0, size: 20 });
+    const rt = S.counter({ x: 600, y: 350, label: 'loads per FMA', value: 0, size: 20, fill: K.red, format: v => v.toFixed(3) });
+    const note = S.text({ x: 40, y: 412, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 432, text: '', size: 12, fill: K.muted });
+    const check = S.text({ x: 40, y: 466, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const Cvals = S.matrix({ x: 660, y: 70, rows: 8, cols: 8, cell, values: C8, fill: 'none', stroke: 'none', valueSize: 10 });
+    Cvals.allVals().forEach(v => v.setNow({ opacity: 0 }));
+    // flyers
+    const fB = S.group({ tx: 0, ty: 0, opacity: 0 }); fB.rect({ x: -11, y: -10, w: 22, h: 20, fill: K.Bfill, stroke: K.B, rx: 3 }); const fBt = fB.text({ x: 0, y: 0.5, text: '', anchor: 'middle', size: 11, weight: 600 });
+    const fA = [];
+    for (let i = 0; i < 8; i++) { const g = S.group({ tx: 0, ty: 0, opacity: 0 }); g.rect({ x: -11, y: -10, w: 22, h: 20, fill: K.Afill, stroke: K.A, rx: 3 }); const t = g.text({ x: 0, y: 0.5, text: '', anchor: 'middle', size: 11, weight: 600 }); fA.push({ g, t }); }
+    const acc = C8.map(() => 0);
+    let loads = 0, fmas = 0;
+    function stepK(d, slow) {
+      const dur = slow ? 0.7 : 0.28, hold = slow ? 1.2 : 0.15;
+      tl.set(kLbl, { text: 'dotIdx = ' + d });
+      // B load, once
+      const [bx, by] = B.center(d, col);
+      tl.to(B.cellAt(d, col), { fill: K.Bfill, stroke: K.B, sw: 1.4 }, 0.2);
+      tl.set(fB, { tx: bx, ty: by, opacity: 1 }, '<'); tl.set(fBt, { text: '' + B8[d][col] }, '<');
+      tl.move(fB, tmpB.center(0, 0)[0], tmpB.center(0, 0)[1], dur, { arc: -40 });
+      tl.set(tmpB.valAt(0, 0), { text: '' + B8[d][col] });
+      tl.hide(fB, 0.1, { at: '<' });
+      loads += 1;
+      tl.to(ld.num, { value: 1 }, 0.2, { at: '<' }); tl.to(ldT.num, { value: loads }, 0.2, { at: '<' });
+      if (slow) tl.wait(0.6);
+      // 8 A loads + 8 FMAs
+      tl.to(A.col(d), { fill: K.Afill, stroke: K.A, sw: 1.2 }, 0.2, { stagger: slow ? 0.06 : 0.02 });
+      const gap = slow ? 0.12 : 0.05, t0 = tl.cursor;
+      for (let i = 0; i < 8; i++) {
+        const [ax, ay] = A.center(i, d), [rx, ry] = R.center(i, 0);
+        const dep = t0 + i * gap, arr = dep + dur;
+        tl.set(fA[i].g, { tx: ax, ty: ay, opacity: 1 }, dep);
+        tl.set(fA[i].t, { text: '' + A8[i][d] }, dep);
+        tl.move(fA[i].g, rx, ry, dur, { at: dep, arc: -30 });
+        acc[i] += A8[i][d] * B8[d][col];
+        tl.hide(fA[i].g, 0.05, { at: arr });
+        tl.set(R.valAt(i, 0), { text: '' + acc[i] }, arr);
+        tl.to(R.cellAt(i, 0), { fill: K.Cfill }, 0.15, { at: arr });
+        tl.to(R.cellAt(i, 0), { fill: K.goldfill }, 0.3, { at: arr + 0.15 });
+      }
+      const tEnd = t0 + 7 * gap + dur;
+      loads += 8; fmas += 8;
+      tl.to(ld.num, { value: 9 }, 0.3, { at: tEnd }); tl.to(fm.num, { value: 8 }, 0.3, { at: tEnd });
+      tl.to(ldT.num, { value: loads }, 0.3, { at: tEnd }); tl.to(fmT.num, { value: fmas }, 0.3, { at: tEnd });
+      tl.to(rt.num, { value: loads / fmas }, 0.3, { at: tEnd });
+      tl.cursor = tEnd + 0.3;
+      tl.wait(hold);
+      tl.to(A.col(d), { fill: '#fff', stroke: '#c9c4bb', sw: 0.7 }, 0.2);
+      tl.to(B.cellAt(d, col), { fill: '#fff', stroke: '#c9c4bb', sw: 0.7 }, 0.2, { at: '<' });
+      tl.set(ld.num, { value: 0 }, '<'); tl.set(fm.num, { value: 0 }, '<');
+    }
+
+    tl.step('This thread owns <b>C[0 … 7][5]</b>: a column of eight outputs. It keeps eight running totals in registers, one per output.');
+    tl.show([R, tmpB], 0.4);
+    tl.wait(1.4);
+    tl.step('Step k = 0. The thread loads <b>B[0][5] once</b> into the register tmpB. Every one of its eight outputs will use it.');
+    stepK(0, true);
+    tl.set(note, { text: 'per step: 1 load of B + 8 loads of A = 9 loads  →  8 multiply-adds  (1.125 loads per FMA)' }, '<');
+    tl.step('Steps k = 1 … 7 repeat the pattern: one B load, eight A loads, eight FMAs into eight independent accumulators.');
+    for (let d = 1; d < 8; d++) stepK(d, false);
+    const ok = acc.every((v, i) => v === C8[i][col]);
+    tl.step('After eight steps the eight accumulators hold <b>column 5 of C</b> exactly. Seventy-two loads for sixty-four multiply-adds: 1.125 per FMA, against kernel 3’s 2.0.');
+    tl.to(R.all(), { fill: K.Cfill, stroke: K.C }, 0.3, { stagger: 0.04 });
+    Cvals.col(col).forEach((c, i) => tl.show(Cvals.valAt(i, col), 0.3, { at: i === 0 ? '<+0.3' : '<+0.04' }));
+    tl.set(check, { text: ok ? '✓ checked live: threadResults[0 … 7] equal C[0 … 7][5]' : '✗ mismatch' });
+    tl.set(note2, { text: 'each B value was used 8 times; each A value once — kernel 5 will fix the A side' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 8.3 the block
+  (function () {
+    const S = MB.scene('a-block', { w: 900, h: 440, title: 'The 64 × 64 block tile of kernel 4' });
+    const tl = S.tl;
+    const bx = 40, by = 60;
+    // 64x64 tile drawn as 8 rows of thread strips: each strip 8 tall x 1 wide → 8 strip-rows × 64 columns; draw as 64 cols x 8 rows of cells (each cell = one thread's 8x1 strip), cell 4x? use rects
+    // the 64 × 64 tile as 8 rows of 64 thread strips, each strip 8 outputs tall and 1 wide (drawn 4 × 16 px)
+    S.text({ x: bx + 128, y: by - 12, text: '64 × 64 tile of C = 512 strips of 8 × 1', anchor: 'middle', size: 12, fill: K.ink, weight: 600 });
+    const strips = [];
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 64; c++) strips.push(S.rect({ x: bx + c * 4, y: by + r * 16.5, w: 3.4, h: 16, fill: '#fff', stroke: '#e0d9cf', sw: 0.5, rx: 0.5 }));
+    const tile = { all: () => strips, cellAt: (r, c) => strips[r * 64 + c] };
+    const tLbl = S.text({ x: bx, y: by + 8 * 16.5 + 12, text: '', size: 11.5, fill: K.muted });
+    const SM = S.membox({ x: 340, y: 60, w: 520, h: 130, label: 'shared memory per chunk — 4 KB', labelPos: 'topleft', labelSize: 12, fill: K.purplefill, stroke: K.purple, rx: 10 });
+    const As = S.matrix({ x: 360, y: 90, rows: 8, cols: 8, cell: 6, stroke: '#c8bde3', sw: 0.5, label: 'As 64 × 8 (2 KB)', labelSize: 10.5, labelPos: 'bottom' });
+    const Bs = S.matrix({ x: 430, y: 90, rows: 8, cols: 64, cell: 6, stroke: '#c8bde3', sw: 0.5, label: 'Bs 8 × 64 (2 KB)', labelSize: 10.5, labelPos: 'bottom' });
+    const T = S.threads({ x: 40, y: 232, n: 512, size: 3.4, gap: 1.2, perRow: 64, fill: '#5b5750' });
+    const tl2 = S.text({ x: 40, y: 222, text: '512 threads — 16 warps', size: 11.5, fill: K.ink, weight: 600, opacity: 0 });
+    const c1 = S.counter({ x: 340, y: 232, label: 'outputs per block', value: 0, size: 20 });
+    const c2 = S.counter({ x: 500, y: 232, label: 'per thread', value: 0, size: 20 });
+    const c3 = S.counter({ x: 620, y: 232, label: 'threads', value: 0, size: 20 });
+    const c4 = S.counter({ x: 740, y: 232, label: 'copies per thread', value: 0, size: 20, format: v => v + ' + ' + v });
+    const note = S.text({ x: 40, y: 330, text: '', size: 12, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 350, text: '', size: 11.5, fill: K.muted });
+    const note3 = S.text({ x: 40, y: 390, text: '', size: 12, fill: K.ink, weight: 600 });
+
+    tl.step('Kernel 4’s block computes a <b>64 × 64</b> tile of C. At eight outputs per thread, that is 512 columns of eight — one per thread, 512 threads, 16 warps.');
+    tl.to(tile.all(), { fill: '#fdf1e4' }, 0.15, { stagger: 0.002 });
+    tl.to(tile.cellAt(2, 9), { fill: K.Cfill, stroke: K.C, sw: 1 }, 0.3);
+    tl.set(tLbl, { text: 'each cell here is one thread’s strip of 8 outputs (8 tall, 1 wide)' });
+    tl.to(c1.num, { value: 4096 }, 0.8); tl.to(c2.num, { value: 8 }, 0.4, { at: '<' }); tl.to(c3.num, { value: 512 }, 0.8, { at: '<' });
+    tl.show(tl2, 0.3);
+    tl.wait(2.0);
+    tl.step('The chunk in shared memory is As, 64 rows × 8, and Bs, 8 × 64 columns: 512 floats each, 4 KB together. 512 elements, 512 threads: each thread copies <b>exactly one</b> element of A and one of B, coalesced, as in kernel 3.');
+    tl.to(As.all(), { fill: K.Afill, stroke: K.A }, 0.15, { stagger: 0.006 });
+    tl.to(Bs.all(), { fill: K.Bfill, stroke: K.B }, 0.15, { at: '<', stagger: 0.0008 });
+    tl.to(c4.num, { value: 1 }, 0.5);
+    tl.set(note, { text: 'BK = 8: a chunk is 8 columns of A and 8 rows of B; K / 8 = 512 chunks per block' });
+    tl.set(note2, { text: 'As is 64 × 8 but drawn here as 8 × 8; the picture is to scale for Bs only' });
+    tl.wait(2.2);
+    tl.step('The tile doubled in both directions, so each value fetched from DRAM serves 64 outputs of its row or column instead of 32: global reads per output fall from <b>K/16 to K/32</b>.');
+    tl.set(note3, { text: 'global reads per output: 2K (kernels 1, 2)  →  K/16 (kernel 3)  →  K/32 (kernel 4)' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 8.4 predict, then measure
+  (function () {
+    const S = MB.scene('a-predict', { w: 900, h: 400, title: 'Predicted against measured speedup for kernel 4' });
+    const tl = S.tl;
+    const x0 = 250, W = 560, max = 9000;
+    S.text({ x: x0, y: 40, text: 'GFLOP/s', size: 12.5, fill: K.ink, weight: 600 });
+    const k3 = S.bar({ x: x0, y: 60, w: 0, h: 22, fill: K.greyfill, stroke: K.grey, label: 'kernel 3, measured', value: 0 });
+    const pr = S.bar({ x: x0, y: 110, w: 0, h: 22, fill: '#fff', stroke: K.A, label: 'kernel 4, predicted from loads/FMA', value: 0, opacity: 0 });
+    pr.rect.setNow({ dash: '5 4' });
+    const k4 = S.bar({ x: x0, y: 160, w: 0, h: 22, fill: K.tealfill, stroke: K.teal, label: 'kernel 4, measured', value: 0, opacity: 0 });
+    const mix = S.text({ x: x0, y: 230, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const l1 = S.text({ x: x0, y: 262, text: '', size: 12, fill: K.muted });
+    const l2 = S.text({ x: x0, y: 282, text: '', size: 12, fill: K.muted });
+    const l3 = S.text({ x: x0, y: 302, text: '', size: 12, fill: K.muted });
+    const l4 = S.text({ x: x0, y: 340, text: '', size: 12.5, fill: K.ink, weight: 600 });
+
+    tl.step('Kernel 3 measured 2,980 GFLOP/s at 2.0 loads per FMA.');
+    k3.grow(tl, W * 2980 / max, 2980, 0.7);
+    tl.wait(1.2);
+    tl.step('The load ratio alone predicts 2 ÷ 1.125 = <b>1.78×</b>: about 5,300 GFLOP/s.');
+    tl.show(pr, 0.2); pr.grow(tl, W * 5298 / max, 5298, 0.8);
+    tl.set(mix, { text: 'instruction mix: 2 LDS per FFMA  →  9 LDS per 8 FFMA  (arithmetic share ⅓ → 8⁄17 ≈ 47%)' });
+    tl.wait(1.6);
+    tl.step('Measured: <b>8,475 GFLOP/s</b>, a 2.84× step. The gap above the prediction is the two other levers kernel 4 pulled at the same time.');
+    tl.show(k4, 0.2); k4.grow(tl, W * 8475 / max, 8475, 0.9);
+    tl.set(l1, { text: '1.  loads per FMA 2.0 → 1.125: the lever chapter 7 asked for (predicts 1.78×)' });
+    tl.set(l2, { text: '2.  block tile 32 × 32 → 64 × 64: DRAM reads per output halved, K/16 → K/32' });
+    tl.set(l3, { text: '3.  eight independent accumulators: several FMAs in flight per thread, where kernel 3 had one' });
+    tl.wait(1.4);
+    tl.step('Kernel 4 used the B sharing and left the A sharing on the table: each A value is still loaded and used once. Kernel 5 takes both.');
+    tl.set(l4, { text: '2,980 → 8,475 GFLOP/s · 12.8% → 36.5% of cuBLAS · next: 8 × 8 per thread, 0.25 loads per FMA' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel 5: 2D blocktiling and the outer product · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 9 · <em>The instruction-starved kernels</em></div>
+<h1>Kernel 5: 2D blocktiling and the outer product</h1>
+<p class="lede">Give one thread an 8 × 8 patch of C, and sixteen numbers in registers turn into sixty-four multiply-adds. This is the picture to keep if you keep only one from the book.</p>
+<div class="byline">Kernel · <em>sgemm2DBlocktiling</em> · 15,972 GFLOP/s · 68.7% of cuBLAS · measured by Simon Boehm on an NVIDIA A6000</div>
+
+<p>Chapter 8 found two kinds of sharing in the definition of C. Outputs stacked in a column share their B operand; outputs side by side in a row share their A operand. Kernel 4 used the first and ignored the second. Its thread owns a tall thin strip, eight outputs in one column, so it gets to reuse each B value eight times and gets nothing at all on A. That is exactly why it still pays eight separate A loads for its eight multiply-adds, and why its ratio stopped at 1.125 loads per FMA.</p>
+
+<p>The fix is to make the thread's territory square. Give it an 8 × 8 patch of C and both sharings come into play at once. This chapter is that one change, watched closely, because the arithmetic it produces has a name and a shape worth knowing on sight.</p>
+
+<h2><span class="no">9.1</span>The sharing kernel 4 ignored</h2>
+
+<p>The 8 × 8 example matrices are the right size to show this on, because an 8 × 8 patch of C is precisely what one thread of kernel 5 owns. Watch what the thread needs for a single step of k, first with kernel 4's strip and then with the square.</p>
+
+<figure class="wide">
+  <div id="a-sharing"></div>
+  <figcaption><b>Figure 9.1.</b> What one thread needs for one step of k. Kernel 4's strip: eight A values and one B value for eight multiply-adds. Kernel 5's square: eight A values and eight B values for sixty-four.</figcaption>
+</figure>
+
+<p>Count it again, because it is the whole kernel. The patch has 64 outputs. Output (i, j) needs A value number i and B value number j. Every one of the 8 A values pairs with every one of the 8 B values, and each pairing is exactly one of the 64 outputs. So 16 loads produce 64 multiply-adds: 0.25 loads per FMA, which is the supply line chapter 7 drew.</p>
+
+<h2><span class="no">9.2</span>The outer product</h2>
+
+<p>The 8 × 8 grid of products you get by pairing every element of one vector with every element of another is called an <em>outer product</em>. It is the opposite of the dot product from chapter 1, which pairs elements position by position and sums them into one number. An outer product takes eight numbers and eight numbers and returns sixty-four, with no summing at all. The summing comes from repeating it: the outer product at step k is added into the same 64 accumulators as the outer product at step k − 1, and after the last step the accumulators hold the patch of C. Here it is with real numbers.</p>
+
+<figure class="wide">
+  <div id="a-outer"></div>
+  <figcaption><b>Figure 9.2.</b> Sixteen numbers in registers, sixty-four multiply-adds out, repeated for every step of k. After eight steps the accumulators hold the 8 × 8 product exactly, cell for cell.</figcaption>
+</figure>
+
+<div class="key">
+  <div class="t">The one picture</div>
+  <p>Every value on the left is used eight times, and so is every value on top. That is where the whole speedup of kernels 4 and 5 comes from: a loaded number, once it sits in a register, is free to reuse, and the outer product is the arrangement that reuses each one as many times as the patch is wide.</p>
+</div>
+
+<h2><span class="no">9.3</span>Three phases per step of k</h2>
+
+<p>The structure of the inner loop matters as much as the count, so here it is in Boehm's kernel 5, lightly trimmed. Each step of k has three phases: copy the eight A operands out of shared memory into registers, copy the eight B operands, and then do the sixty-four multiply-adds without touching memory at all.</p>
+
+<pre><code><span class="k">float</span> threadResults[TM * TN] = {<span class="n">0.0</span>};   <span class="c">// 64 accumulators, in registers</span>
+<span class="k">float</span> regM[TM] = {<span class="n">0.0</span>};                 <span class="c">// 8 A operands, in registers</span>
+<span class="k">float</span> regN[TN] = {<span class="n">0.0</span>};                 <span class="c">// 8 B operands, in registers</span>
+
+<span class="k">for</span> (<span class="k">uint</span> dotIdx = <span class="n">0</span>; dotIdx &lt; BK; ++dotIdx) {
+  <span class="c">// phase 1: stage this thread's 8 A values (one column of As)</span>
+  <span class="k">for</span> (<span class="k">uint</span> i = <span class="n">0</span>; i &lt; TM; ++i)
+    regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+  <span class="c">// phase 2: stage its 8 B values (one row of Bs)</span>
+  <span class="k">for</span> (<span class="k">uint</span> i = <span class="n">0</span>; i &lt; TN; ++i)
+    regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+  <span class="c">// phase 3: 64 multiply-adds that touch no memory at all</span>
+  <span class="k">for</span> (<span class="k">uint</span> m = <span class="n">0</span>; m &lt; TM; ++m)
+    <span class="k">for</span> (<span class="k">uint</span> n = <span class="n">0</span>; n &lt; TN; ++n)
+      threadResults[m * TN + n] += regM[m] * regN[n];
+}</code></pre>
+
+<figure class="wide">
+  <div id="a-phases"></div>
+  <figcaption><b>Figure 9.3.</b> One step of kernel 5's inner loop, as the thread sees it. Sixteen shared-memory loads, then sixty-four FMAs from registers alone, then the next step of k in the same chunk.</figcaption>
+</figure>
+
+<p>That staging step is what people mean when they say a kernel "caches in registers". Shared memory was a cache we filled by hand for the block; the register file is now a second cache we fill by hand for the thread. Each kernel in this book has added one more level of the hierarchy to the scheme, and this is the last level there is. There is nothing closer to the arithmetic than a register.</p>
+
+<h2><span class="no">9.4</span>The block reshapes again</h2>
+
+<p>With 64 outputs per thread the block has to change shape, for the same reason it did in kernel 4. Boehm's kernel 5 uses a 128 × 128 tile of C and keeps BK = 8, and the numbers line up like this.</p>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Threads per block</div><div class="v">256</div><div class="d">128 × 128 outputs ÷ 64 per thread</div></div>
+  <div class="cell"><div class="l">Shared memory per chunk</div><div class="v">8<small>KB</small></div><div class="d">As 128 × 8 + Bs 8 × 128 floats</div></div>
+  <div class="cell"><div class="l">Copies per thread per chunk</div><div class="v">4 + 4</div><div class="d">1,024 elements each ÷ 256 threads</div></div>
+  <div class="cell good"><div class="l">Global reads per output</div><div class="v">K/64</div><div class="d">down from K/32 in kernel 4</div></div>
+</div>
+
+<figure class="wide">
+  <div id="a-block"></div>
+  <figcaption><b>Figure 9.4.</b> The 128 × 128 block tile as 256 patches of 8 × 8, one per thread, and the 8 KB of shared memory that feeds a chunk. Because the tile doubled in both directions, each value fetched from DRAM now serves 128 outputs of a row or column instead of 64.</figcaption>
+</figure>
+
+<p>Two things changed at once here, and it is worth keeping them apart. The wider block tile cut the global-memory traffic, from K/32 reads per output to K/64, the same lever kernels 3 and 4 pulled. The square thread tile cut the shared-memory traffic, from 1.125 loads per FMA to 0.25, which is the lever chapter 7 said mattered now. Kernel 5 pulls both, and it needs at least 64 + 8 + 8 = 80 registers per thread to do it, since the accumulators have to live in registers for the whole kernel. That cost is the subject of the next chapter.</p>
+
+<h2><span class="no">9.5</span>Kernels 3, 4 and 5 are one idea, three times</h2>
+
+<p>Stepping back, the three shared-memory kernels are a single idea applied with increasing appetite: keep the operands close, and make each one you fetched serve as many multiply-adds as possible. The chart below is the whole story of them. Loads per multiply-add fall 2 → 1.125 → 0.25, and speed rises 2,980 → 8,475 → 15,972 GFLOP/s. They are mirror images, which is the point. Over this stretch, performance is set almost entirely by how many shared-memory instructions each unit of arithmetic costs.</p>
+
+<figure class="wide">
+  <div id="a-mirror"></div>
+  <figcaption><b>Figure 9.5.</b> Both budgets across the three kernels. The block tile (top) decides how much DRAM traffic you pay; the thread tile (middle) decides how many shared-memory instructions you pay; the speed (bottom) follows the second one almost exactly.</figcaption>
+</figure>
+
+<p>Measured: 8,475 → 15,972 GFLOP/s, and we are past two thirds of cuBLAS with a kernel that is still only about forty lines long. Which raises the obvious question. If a bigger thread tile keeps helping, why stop at 8 × 8? Why not 16 × 16, with 256 accumulators? The answer is that registers are a shared, fixed resource on the SM, and the packing game that decides how many warps can be resident is the next chapter.</p>
+
+<div class="pager"></div>
+<div class="colophon">The outer-product animation multiplies the shared 8 × 8 example live: the accumulators after the eighth step are checked against MB.C8 in the page's own script. Tile sizes are Boehm's kernel 5 settings for the A6000 (BM = BN = 128, BK = 8, TM = TN = 8); the per-output read counts (K/16, K/32, K/64) and GFLOP/s figures are his, from the <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+  const A8 = MB.A8, B8 = MB.B8, C8 = MB.C8;
+
+  // ------------------------------------------------------------ 9.1 both sharings
+  (function () {
+    const S = MB.scene('a-sharing', { w: 900, h: 470, title: 'What one thread needs for one step of k: strip against square' });
+    const tl = S.tl, cell = 26;
+    const A = S.matrix({ x: 60, y: 70, rows: 8, cols: 8, cell, values: A8, label: 'A (the thread’s 8 rows)', labelSize: 13 });
+    const B = S.matrix({ x: 330, y: 70, rows: 8, cols: 8, cell, values: B8, label: 'B (the thread’s 8 columns)', labelSize: 13 });
+    const C = S.matrix({ x: 600, y: 70, rows: 8, cols: 8, cell, label: 'C — this thread’s outputs', labelSize: 13 });
+    const d = 2;
+    const kLbl = S.text({ x: 450, y: 34, text: 'one step of the inner loop: k = ' + d, anchor: 'middle', size: 13, fill: K.ink, weight: 600, font: 'mono', opacity: 0 });
+    const loads = S.counter({ x: 60, y: 320, label: 'loads from shared memory', value: 0, size: 24 });
+    const fmas = S.counter({ x: 300, y: 320, label: 'multiply-adds they feed', value: 0, size: 24 });
+    const ratio = S.counter({ x: 540, y: 320, label: 'loads per FMA', value: 0, size: 24, fill: K.red, format: v => v.toFixed(3) });
+    const note = S.text({ x: 60, y: 392, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 60, y: 412, text: '', size: 12, fill: K.muted });
+    const note3 = S.text({ x: 60, y: 432, text: '', size: 12, fill: K.muted });
+
+    tl.step('<b>Kernel 4’s thread</b> owns eight outputs in one column of C. At step k it needs eight values of A, one per row, and a single value of B.');
+    tl.show(kLbl, 0.3);
+    tl.to(C.col(3), { fill: K.Cfill, stroke: K.C, sw: 1.2 }, 0.25, { stagger: 0.05 });
+    tl.to(A.col(d), { fill: K.Afill, stroke: K.A, sw: 1.2 }, 0.25, { at: '<+0.2', stagger: 0.05 });
+    tl.to(B.cellAt(d, 3), { fill: K.Bfill, stroke: K.B, sw: 1.6 }, 0.3);
+    tl.to(loads.num, { value: 9 }, 0.5, { at: '<' });
+    tl.to(fmas.num, { value: 8 }, 0.5, { at: '<' });
+    tl.to(ratio.num, { value: 1.125 }, 0.5, { at: '<' });
+    tl.set(note, { text: 'kernel 4: 8 loads of A + 1 load of B = 9 loads  →  8 multiply-adds' });
+    tl.set(note2, { text: 'the B value is reused 8 times; each A value is used once' });
+    tl.wait(2.2);
+
+    tl.step('Outputs side by side share their A operand: C[i][3] and C[i][4] both use A[i][k]. Kernel 4 loads A[i][k] and uses it <b>once</b>. That is the sharing it ignores.');
+    tl.to(C.col(4), { fill: '#fdf1e4', stroke: K.C, sw: 1 }, 0.25, { stagger: 0.05 });
+    tl.set(note3, { text: 'the eight A values could each serve a second column, a third … an eighth — if the thread owned them' });
+    tl.wait(2.2);
+
+    tl.step('So make the thread’s territory <b>square</b>: an 8 × 8 patch. Now each A value serves the eight outputs in its row, and each B value serves the eight outputs in its column.');
+    tl.to(C.all(), { fill: K.Cfill, stroke: K.C, sw: 1 }, 0.25, { stagger: 0.008 });
+    tl.to(B.row(d), { fill: K.Bfill, stroke: K.B, sw: 1.2 }, 0.25, { at: '<+0.2', stagger: 0.05 });
+    tl.to(loads.num, { value: 16 }, 0.5);
+    tl.to(fmas.num, { value: 64 }, 0.5, { at: '<' });
+    tl.to(ratio.num, { value: 0.25 }, 0.5, { at: '<' });
+    tl.to(ratio.num, { fill: K.green }, 0.3, { at: '<' });
+    tl.set(note, { text: 'kernel 5: 8 loads of A + 8 loads of B = 16 loads  →  64 multiply-adds' });
+    tl.set(note2, { text: 'every A value is used 8 times, and so is every B value' });
+    tl.set(note3, { text: '' });
+    tl.wait(2.0);
+
+    tl.step('Sixteen loads, sixty-four multiply-adds: <b>0.25 loads per FMA</b>, which is exactly the supply line chapter 7 drew. Output (i, j) needs A value i and B value j, so every A pairs with every B, once.');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 9.2 the outer product (the figure)
+  (function () {
+    const S = MB.scene('a-outer', { w: 900, h: 520, title: 'The outer product: 16 registers become 64 multiply-adds, every step of k' });
+    const tl = S.tl;
+    const cA = 20, cG = 30;
+    const A = S.matrix({ x: 40, y: 150, rows: 8, cols: 8, cell: cA, values: A8, label: 'As — the thread’s 8 rows', labelSize: 12, valueSize: 9.5 });
+    const B = S.matrix({ x: 700, y: 150, rows: 8, cols: 8, cell: cA, values: B8, label: 'Bs — the thread’s 8 columns', labelSize: 12, valueSize: 9.5 });
+    const gx = 330, gy = 150;
+    const regM = S.matrix({ x: gx - cG - 14, y: gy, rows: 8, cols: 1, cell: cG, values: A8.map(r => [r[0]]), fill: K.goldfill, stroke: K.gold, sw: 1.2, label: 'regM', labelSize: 12, labelPos: 'top', valueSize: 13, opacity: 0 });
+    const regN = S.matrix({ x: gx, y: gy - cG - 14, rows: 1, cols: 8, cell: cG, values: [B8[0].slice()], fill: K.goldfill, stroke: K.gold, sw: 1.2, label: 'regN', labelSize: 12, labelPos: 'right', valueSize: 13, opacity: 0 });
+    const G = S.matrix({ x: gx, y: gy, rows: 8, cols: 8, cell: cG, values: C8.map(r => r.map(() => 0)), fill: '#fff', stroke: '#d8d2c6', valueSize: 11.5, label: '', opacity: 1 });
+    G.allVals().forEach(v => v.setNow({ opacity: 0 }));
+    const gLbl = S.text({ x: gx + 120, y: gy + 8 * cG + 16, text: 'threadResults — 64 accumulators, in registers', anchor: 'middle', size: 12, fill: K.muted });
+    const kLbl = S.text({ x: gx + 120, y: 36, text: '', anchor: 'middle', size: 14, fill: K.ink, weight: 600, font: 'mono' });
+    const opLbl = S.text({ x: gx + 120, y: 56, text: '', anchor: 'middle', size: 11.5, fill: K.muted });
+    const ldC = S.counter({ x: 40, y: 400, label: 'loads so far', value: 0, size: 22 });
+    const fmC = S.counter({ x: 180, y: 400, label: 'multiply-adds so far', value: 0, size: 22 });
+    const rtC = S.counter({ x: 700, y: 400, label: 'loads per FMA', value: 0, size: 22, fill: K.green, format: v => v.toFixed(2) });
+    const check = S.text({ x: 40, y: 470, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const check2 = S.text({ x: 40, y: 490, text: '', size: 12, fill: K.muted });
+
+    // running accumulators, computed live
+    const acc = C8.map(r => r.map(() => 0));
+    let loads = 0, fmas = 0;
+
+    function stage(d, dur) {
+      // highlight column d of As and row d of Bs, update registers
+      tl.to(A.col(d), { fill: K.Afill, stroke: K.A, sw: 1.2 }, dur, { stagger: dur * 0.15 });
+      tl.to(B.row(d), { fill: K.Bfill, stroke: K.B, sw: 1.2 }, dur, { at: '<', stagger: dur * 0.15 });
+      for (let i = 0; i < 8; i++) tl.set(regM.valAt(i, 0), { text: '' + A8[i][d] }, '<+' + (dur * 0.5).toFixed(3));
+      for (let j = 0; j < 8; j++) tl.set(regN.valAt(0, j), { text: '' + B8[d][j] }, '<');
+      loads += 16;
+      tl.to(ldC.num, { value: loads }, dur, { at: '<' });
+      tl.set(kLbl, { text: 'k = ' + d }, '<');
+    }
+    function unstage(d, dur) {
+      tl.to(A.col(d), { fill: '#fff', stroke: '#c9c4bb', sw: 0.7 }, dur, { at: '<' });
+      tl.to(B.row(d), { fill: '#fff', stroke: '#c9c4bb', sw: 0.7 }, dur, { at: '<' });
+    }
+    function products(d, per) {
+      const t0 = tl.cursor;
+      let k = 0;
+      for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) {
+        acc[i][j] += A8[i][d] * B8[d][j];
+        const at = t0 + k * per; k++;
+        tl.set(G.valAt(i, j), { text: '' + acc[i][j], opacity: 1 }, at);
+        tl.to(G.cellAt(i, j), { fill: K.Cfill }, per * 2, { at });
+        tl.to(G.cellAt(i, j), { fill: d === 7 ? '#fde4cc' : '#fff7ef' }, per * 4, { at: at + per * 2 });
+      }
+      fmas += 64;
+      tl.to(fmC.num, { value: fmas }, per * 64, { at: t0, ease: 'linear' });
+      tl.to(rtC.num, { value: loads / fmas }, 0.3, { at: t0 + per * 64 });
+      tl.cursor = t0 + per * 64 + 0.3;
+    }
+
+    tl.step('Step k = 0. The thread copies <b>eight A values</b> (column 0 of its rows of As) into regM, and <b>eight B values</b> (row 0 of its columns of Bs) into regN. Sixteen loads, sixteen registers.');
+    tl.show([regM, regN], 0.3);
+    stage(0, 0.5);
+    tl.wait(1.6);
+
+    tl.step('Now every regM pairs with every regN: <b>64 products</b>, one per cell, each landing in its own accumulator. No memory is touched; the operands are already in registers.');
+    tl.set(opLbl, { text: 'threadResults[i][j] += regM[i] × regN[j]' });
+    products(0, 0.035);
+    tl.wait(1.4);
+    unstage(0, 0.3);
+
+    tl.step('Step k = 1: sixteen new loads into the same sixteen registers, and sixty-four more multiply-adds <b>added</b> into the same sixty-four accumulators.');
+    stage(1, 0.45);
+    tl.wait(0.4);
+    products(1, 0.02);
+    tl.wait(1.2);
+    unstage(1, 0.3);
+
+    tl.step('Steps k = 2 to 7 go the same way. Watch the ratio: sixteen loads for every sixty-four multiply-adds, <b>0.25</b>, at every step.');
+    for (let d = 2; d < 8; d++) { stage(d, 0.3); products(d, 0.006); tl.wait(0.15); unstage(d, 0.2); }
+    tl.wait(0.8);
+
+    // verify live against MB.C8
+    const okAll = acc.every((r, i) => r.every((v, j) => v === C8[i][j]));
+    tl.step('After the eighth step the 64 accumulators hold the 8 × 8 product <b>exactly</b>: the same numbers chapter 1 computed cell by cell. Over the eight steps: 128 loads, 512 multiply-adds, every register value used eight times.');
+    tl.set(check, { text: okAll ? '✓ checked live: all 64 accumulators equal C = A × B' : '✗ mismatch against C' });
+    tl.set(check2, { text: '128 loads for 512 FMAs = 0.25 loads per FMA  ·  kernel 3 spent 2.0  ·  kernel 4 spent 1.125' });
+    tl.to(G.all(), { stroke: K.C, sw: 1 }, 0.4, { stagger: 0.005 });
+    tl.wait(3.5);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 9.3 three phases
+  (function () {
+    const S = MB.scene('a-phases', { w: 900, h: 480, title: 'One step of k in kernel 5: two staging phases, then 64 FMAs' });
+    const tl = S.tl;
+    const SM = S.membox({ x: 40, y: 60, w: 400, h: 300, label: 'shared memory — this chunk', labelPos: 'topleft', labelSize: 12, fill: K.purplefill, stroke: K.purple, rx: 10 });
+    const As = S.matrix({ x: 64, y: 100, rows: 16, cols: 8, cell: 12, label: 'As (128 × 8, part)', labelSize: 11, labelPos: 'bottom', stroke: '#c8bde3', sw: 0.6 });
+    const Bs = S.matrix({ x: 190, y: 100, rows: 8, cols: 16, cell: 12, label: 'Bs (8 × 128, part)', labelSize: 11, labelPos: 'bottom', stroke: '#c8bde3', sw: 0.6 });
+    const RG = S.membox({ x: 490, y: 60, w: 370, h: 130, label: 'this thread’s registers', labelPos: 'topleft', labelSize: 12, fill: K.goldfill, stroke: K.gold, rx: 10 });
+    const regM = S.threads({ x: 510, y: 92, n: 8, size: 14, gap: 4, fill: '#fff', stroke: K.gold, label: 'regM', labelPos: 'bottom' });
+    const regN = S.threads({ x: 690, y: 92, n: 8, size: 14, gap: 4, fill: '#fff', stroke: K.gold, label: 'regN', labelPos: 'bottom' });
+    const accs = S.threads({ x: 510, y: 138, n: 64, size: 9, gap: 2, perRow: 32, fill: '#fff', stroke: '#d9c27a', label: '', labelPos: 'bottom' });
+    const accLbl = S.text({ x: 510, y: 176, text: 'threadResults[64]', size: 10.5, fill: K.muted });
+    const LN = S.membox({ x: 490, y: 220, w: 370, h: 140, label: 'FP32 lane — a × b + c', labelPos: 'topleft', labelSize: 12, fill: K.tealfill, stroke: K.teal, rx: 10 });
+    const laneGrid = S.threads({ x: 510, y: 252, n: 64, size: 9, gap: 2, perRow: 32, fill: '#fff', stroke: '#9fc9c0' });
+    const laneNote = S.text({ x: 510, y: 300, text: '', size: 11.5, fill: K.teal, weight: 600 });
+    const laneNote2 = S.text({ x: 510, y: 318, text: '', size: 11, fill: K.muted });
+    const phase = S.text({ x: 40, y: 400, text: '', size: 13, fill: K.ink, weight: 600 });
+    const cnt = S.counter({ x: 40, y: 430, label: 'loads this step', value: 0, size: 20 });
+    const cnt2 = S.counter({ x: 220, y: 430, label: 'FMAs this step', value: 0, size: 20 });
+    const cnt3 = S.counter({ x: 400, y: 430, label: 'memory touched in phase 3', value: 0, size: 20, format: v => (v === 0 ? 'none' : v) });
+    const dLbl = S.text({ x: 860, y: 400, text: 'dotIdx = 0 of 8', anchor: 'end', size: 12.5, fill: K.ink, weight: 600, font: 'mono' });
+    const chunkLbl = S.text({ x: 860, y: 420, text: 'chunk 1 of 512', anchor: 'end', size: 11.5, fill: K.muted, font: 'mono' });
+    // this thread's slice: rows 0-7 of As, cols 0-7 of Bs
+    const flyA = [], flyB = [];
+    for (let i = 0; i < 8; i++) {
+      const [ax, ay] = As.center(i, 0);
+      flyA.push(S.circle({ cx: 0, cy: 0, r: 4, fill: K.A, opacity: 0, tx: ax, ty: ay }));
+      const [bx, by] = Bs.center(0, i);
+      flyB.push(S.circle({ cx: 0, cy: 0, r: 4, fill: K.B, opacity: 0, tx: bx, ty: by }));
+    }
+    function resetPrev(d) {
+      // clear the previous dotIdx's highlights at the START of the next one, so every step ends on a full frame
+      tl.to(laneGrid.items, { fill: '#fff' }, 0.15);
+      tl.to(As.block(0, d - 1, 8, 1), { fill: '#fff', stroke: '#c8bde3' }, 0.15, { at: '<' });
+      tl.to(Bs.block(d - 1, 0, 1, 8), { fill: '#fff', stroke: '#c8bde3' }, 0.15, { at: '<' });
+      tl.to([regM.items, regN.items], { fill: '#fff' }, 0.15, { at: '<' });
+      tl.set(cnt.num, { value: 0 }, '<'); tl.set(cnt2.num, { value: 0 }, '<');
+      tl.set(laneNote, { text: '' }, '<');
+    }
+    function stepK(d, slow) {
+      const dur = slow ? 0.6 : 0.22, hold = slow ? 1.4 : 0.25;
+      if (d > 0) resetPrev(d);
+      tl.set(dLbl, { text: 'dotIdx = ' + d + ' of 8' });
+      tl.set(phase, { text: 'phase 1 — copy column ' + d + ' of the thread’s rows of As into regM (8 loads)' });
+      tl.to(As.block(0, d, 8, 1), { fill: K.Afill, stroke: K.A }, 0.2, { stagger: 0.03 });
+      flyA.forEach((f, i) => { const [ax, ay] = As.center(i, d); tl.set(f, { tx: ax, ty: ay, opacity: 1 }, i === 0 ? '<' : '<'); });
+      flyA.forEach((f, i) => { const [rx, ry] = regM.center(i); tl.move(f, rx, ry, dur, { at: i === 0 ? '>' : '<+0.04', arc: -30 }); });
+      tl.to(regM.items, { fill: K.Afill }, 0.2, { at: '<+' + dur.toFixed(2), stagger: 0.03 });
+      tl.hide(flyA, 0.1, { at: '<' });
+      tl.to(cnt.num, { value: 8 }, 0.3, { at: '<' });
+      tl.wait(hold * 0.6);
+      tl.set(phase, { text: 'phase 2 — copy row ' + d + ' of the thread’s columns of Bs into regN (8 loads)' });
+      tl.to(Bs.block(d, 0, 1, 8), { fill: K.Bfill, stroke: K.B }, 0.2, { stagger: 0.03 });
+      flyB.forEach((f, i) => { const [bx, by] = Bs.center(d, i); tl.set(f, { tx: bx, ty: by, opacity: 1 }, '<'); });
+      flyB.forEach((f, i) => { const [rx, ry] = regN.center(i); tl.move(f, rx, ry, dur, { at: i === 0 ? '>' : '<+0.04', arc: -30 }); });
+      tl.to(regN.items, { fill: K.Bfill }, 0.2, { at: '<+' + dur.toFixed(2), stagger: 0.03 });
+      tl.hide(flyB, 0.1, { at: '<' });
+      tl.to(cnt.num, { value: 16 }, 0.3, { at: '<' });
+      tl.wait(hold * 0.6);
+      tl.set(phase, { text: 'phase 3 — 64 multiply-adds, regM[i] × regN[j] into threadResults[i][j], touching no memory' });
+      tl.to(laneGrid.items, { fill: K.teal }, 0.05, { stagger: slow ? 0.02 : 0.004 });
+      tl.to(accs.items, { fill: K.Cfill, stroke: K.C }, 0.05, { at: '<', stagger: slow ? 0.02 : 0.004 });
+      tl.to(cnt2.num, { value: 64 }, slow ? 1.3 : 0.4, { at: '<', ease: 'linear' });
+      tl.set(laneNote, { text: '64 FMAs from registers alone' }, '<');
+      tl.wait(hold);
+    }
+    function quickK(d) {
+      resetPrev(d);
+      tl.set(dLbl, { text: 'dotIdx = ' + d + ' of 8' });
+      tl.set(phase, { text: 'phases 1–3 again for dotIdx = ' + d }, '<');
+      tl.to(As.block(0, d, 8, 1), { fill: K.Afill, stroke: K.A }, 0.1);
+      tl.to(regM.items, { fill: K.Afill }, 0.1, { at: '<' });
+      tl.to(Bs.block(d, 0, 1, 8), { fill: K.Bfill, stroke: K.B }, 0.1, { at: '<+0.12' });
+      tl.to(regN.items, { fill: K.Bfill }, 0.1, { at: '<' });
+      tl.to(cnt.num, { value: 16 }, 0.15, { at: '<' });
+      tl.to(laneGrid.items, { fill: K.teal }, 0.05, { at: '<+0.14', stagger: 0.002 });
+      tl.to(accs.items, { fill: K.Cfill, stroke: K.C }, 0.05, { at: '<', stagger: 0.002 });
+      tl.to(cnt2.num, { value: 64 }, 0.2, { at: '<', ease: 'linear' });
+      tl.set(laneNote, { text: '64 FMAs from registers alone' }, '<');
+      tl.wait(0.3);
+    }
+    tl.step('The thread owns rows 0–7 of As and columns 0–7 of Bs in this chunk. <b>Phase 1:</b> it copies one column of its eight rows into regM. Eight loads from shared memory.');
+    stepK(0, true);
+    tl.step('That was one value of dotIdx. Kernel 5 uses BK = 8, so a chunk holds eight of them; the thread repeats the three phases for dotIdx = 1 … 7, then the block loads the next chunk.');
+    stepK(1, false);
+    for (let d = 2; d < 8; d++) quickK(d);
+    tl.set(laneNote2, { text: 'per step: 16 loads, 64 FMAs · per chunk: 128 loads, 512 FMAs' });
+    tl.wait(0.6);
+    tl.step('Then the next of 512 chunks, and the same three phases again. The accumulators never leave the registers until the very end, when the thread writes its 8 × 8 patch to C.');
+    tl.set(chunkLbl, { text: 'chunk 2 of 512' });
+    tl.set(dLbl, { text: 'dotIdx = 0 of 8' }, '<');
+    tl.to(accs.items, { fill: '#fde4cc' }, 0.4);
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 9.4 the block
+  (function () {
+    const S = MB.scene('a-block', { w: 900, h: 470, title: 'The 128 × 128 block tile of kernel 5' });
+    const tl = S.tl;
+    const bx = 40, by = 60, pc = 15; // 16x16 patches of 15px = 240
+    const tile = S.matrix({ x: bx, y: by, rows: 16, cols: 16, cell: pc, gap: 1, stroke: '#e0d9cf', sw: 0.6, label: '128 × 128 tile of C = 16 × 16 patches', labelSize: 12 });
+    const one = S.matrix({ x: bx + 3 * 16 + 1, y: by + 2 * 16 + 1, rows: 8, cols: 8, cell: 1.6, gap: 0, stroke: 'none', fill: K.C, opacity: 0 });
+    const tLbl = S.text({ x: bx, y: by + 16 * 16 + 14, text: '', size: 11.5, fill: K.muted });
+    const SM = S.membox({ x: 340, y: 60, w: 520, h: 150, label: 'shared memory per chunk — 8 KB', labelPos: 'topleft', labelSize: 12, fill: K.purplefill, stroke: K.purple, rx: 10 });
+    const As = S.matrix({ x: 360, y: 92, rows: 16, cols: 8, cell: 6, stroke: '#c8bde3', sw: 0.5, label: 'As 128 × 8 (4 KB)', labelSize: 10.5, labelPos: 'bottom' });
+    const Bs = S.matrix({ x: 440, y: 92, rows: 8, cols: 64, cell: 6, stroke: '#c8bde3', sw: 0.5, label: 'Bs 8 × 128 (4 KB)', labelSize: 10.5, labelPos: 'bottom' });
+    const T = S.threads({ x: 340, y: 246, n: 256, size: 5, gap: 2, perRow: 64, fill: '#5b5750', label: '', labelPos: 'top' });
+    const tl2 = S.text({ x: 340, y: 236, text: '256 threads — 8 warps', size: 11.5, fill: K.ink, weight: 600, opacity: 0 });
+    const c1 = S.counter({ x: 340, y: 300, label: 'outputs per block', value: 0, size: 20 });
+    const c2 = S.counter({ x: 500, y: 300, label: 'per thread', value: 0, size: 20 });
+    const c3 = S.counter({ x: 620, y: 300, label: 'threads', value: 0, size: 20 });
+    const c4 = S.counter({ x: 740, y: 300, label: 'copies per thread per chunk', value: 0, size: 20, format: v => v + ' + ' + v });
+    const note = S.text({ x: 340, y: 360, text: '', size: 12, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 340, y: 380, text: '', size: 11.5, fill: K.muted });
+    const note3 = S.text({ x: 340, y: 420, text: '', size: 12, fill: K.ink, weight: 600 });
+    const note4 = S.text({ x: 340, y: 440, text: '', size: 11.5, fill: K.muted });
+
+    tl.step('Kernel 5’s block computes a <b>128 × 128</b> tile of C. At 64 outputs per thread, that is 256 patches of 8 × 8: one per thread.');
+    tl.to(tile.all(), { fill: '#fdf1e4' }, 0.2, { stagger: 0.004 });
+    tl.show(one, 0.3); tl.to(tile.cellAt(2, 3), { fill: K.Cfill, stroke: K.C, sw: 1.2 }, 0.3, { at: '<' });
+    tl.set(tLbl, { text: 'one patch = one thread = 64 accumulators in registers' });
+    tl.to(c1.num, { value: 16384 }, 0.8); tl.to(c2.num, { value: 64 }, 0.4, { at: '<' }); tl.to(c3.num, { value: 256 }, 0.8, { at: '<' });
+    tl.show(tl2, 0.3);
+    tl.to(T.items, { fill: '#5b5750' }, 0.05, { at: '<', stagger: 0.003 });
+    tl.wait(2.0);
+
+    tl.step('The chunk in shared memory is As, 128 rows × 8, and Bs, 8 × 128 columns: 1,024 floats each, 8 KB together. With 256 threads, each thread copies <b>four</b> elements of A and four of B per chunk, not one.');
+    tl.to(As.all(), { fill: K.Afill, stroke: K.A }, 0.15, { stagger: 0.004 });
+    tl.to(Bs.all(), { fill: K.Bfill, stroke: K.B }, 0.15, { at: '<', stagger: 0.001 });
+    tl.to(c4.num, { value: 4 }, 0.5);
+    tl.set(note, { text: 'BK = 8: a chunk is 8 columns of A and 8 rows of B; K / 8 = 512 chunks per block' });
+    tl.set(note2, { text: 'the copies are still coalesced: neighboring threads copy neighboring elements' });
+    tl.wait(2.2);
+
+    tl.step('Because the tile doubled in both directions, each value fetched from DRAM now serves <b>128</b> outputs of its row or column instead of 64. Global reads per output fall from K/32 to K/64.');
+    tl.set(note3, { text: 'global reads per output: 2K (kernels 1, 2) → K/16 (kernel 3) → K/32 (kernel 4) → K/64 (kernel 5)' });
+    tl.set(note4, { text: 'and the cost: at least 64 + 8 + 8 = 80 registers per thread, for the whole kernel — chapter 10' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 9.5 the mirror
+  (function () {
+    const S = MB.scene('a-mirror', { w: 900, h: 430, title: 'Loads per FMA against speed for kernels 3, 4 and 5' });
+    const tl = S.tl;
+    const x0 = 250, W = 520;
+    const rows = [
+      { y: 40, title: 'global reads per output (block tile)', unit: '', vals: [256, 128, 64], max: 256, fill: K.greyfill, stroke: K.grey, fmt: v => MB.fmt(v) },
+      { y: 160, title: 'shared-memory loads per FMA (thread tile)', unit: '', vals: [2, 1.125, 0.25], max: 2, fill: K.redfill, stroke: K.red, fmt: v => v.toFixed(3) },
+      { y: 280, title: 'measured speed, GFLOP/s', unit: '', vals: [2980, 8475, 15972], max: 16000, fill: K.tealfill, stroke: K.teal, fmt: v => MB.fmt(v) },
+    ];
+    const names = ['kernel 3', 'kernel 4', 'kernel 5'];
+    const bars = rows.map(r => {
+      S.text({ x: x0, y: r.y, text: r.title, size: 12.5, fill: K.ink, weight: 600 });
+      return r.vals.map((v, i) => S.bar({ x: x0, y: r.y + 14 + i * 26, w: 0, h: 18, fill: r.fill, stroke: r.stroke, label: names[i], value: 0, format: r.fmt }));
+    });
+    const side = S.text({ x: 40, y: 400, text: '', size: 12.5, fill: K.ink, weight: 600 });
+
+    tl.step('The block tile decides how much DRAM traffic you pay. 32 × 32, then 64 × 64, then 128 × 128: reads per output fall 256 → 128 → 64.');
+    rows[0].vals.forEach((v, i) => bars[0][i].grow(tl, W * v / rows[0].max, v, 0.7, { at: i === 0 ? '>' : '<+0.15' }));
+    tl.wait(1.8);
+    tl.step('The thread tile decides how many shared-memory instructions you pay. 1 × 1, then 8 × 1, then 8 × 8: loads per FMA fall <b>2 → 1.125 → 0.25</b>.');
+    rows[1].vals.forEach((v, i) => bars[1][i].grow(tl, W * v / rows[1].max, v, 0.7, { at: i === 0 ? '>' : '<+0.15' }));
+    tl.wait(1.8);
+    tl.step('And the speed follows the second one almost exactly: <b>2,980 → 8,475 → 15,972 GFLOP/s</b>. Over this stretch, performance is set by how many shared-memory instructions each unit of arithmetic costs.');
+    rows[2].vals.forEach((v, i) => bars[2][i].grow(tl, W * v / rows[2].max, v, 0.9, { at: i === 0 ? '>' : '<+0.15' }));
+    tl.set(side, { text: 'mirror images: loads per FMA ÷ 8, speed × 5.4' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

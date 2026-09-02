@@ -1,0 +1,162 @@
+/* How a Matmul Kernel Gets Fast — book stylesheet */
+:root{
+  --paper:#fdfcf9; --ink:#232323; --muted:#6f6a60; --faint:#b9b4a8; --accent:#a04c38;
+  --rule:#e6e2d7; --codebg:#f5f3ec; --asidebg:#f8f5ed; --panel:#ffffff;
+  --blue:#2563c9; --green:#1f7a45; --red:#c22f2f; --purple:#6d43b8; --orange:#d9660c; --gold:#b8860b; --teal:#2a7d6f;
+  --serif:"Newsreader",Georgia,"Times New Roman",serif;
+  --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --col:720px; --wide:960px;
+}
+*{box-sizing:border-box}
+html{background:var(--paper); scroll-behavior:smooth}
+body{margin:0; background:var(--paper); color:var(--ink); font-family:var(--serif); font-size:19px; line-height:1.62; font-variant-numeric:oldstyle-nums; -webkit-font-smoothing:antialiased}
+a{color:var(--accent); text-decoration:underline; text-decoration-thickness:1px; text-underline-offset:2.5px; text-decoration-color:#cfa294}
+a:hover{text-decoration-color:var(--accent)}
+strong,b{font-weight:600}
+
+/* ---- top bar */
+.topbar{position:sticky; top:0; z-index:50; background:rgba(253,252,249,.92); backdrop-filter:blur(8px); border-bottom:1px solid var(--rule); font-family:var(--sans); font-size:13px}
+.topbar .in{max-width:1280px; margin:0 auto; padding:0 20px; height:48px; display:flex; align-items:center; gap:18px}
+.topbar .brand{color:var(--ink); text-decoration:none; font-weight:600; letter-spacing:-.01em; white-space:nowrap}
+.topbar .brand span{color:var(--muted); font-weight:400}
+.topbar .where{color:var(--muted); flex:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.topbar .navbtn{color:var(--ink); text-decoration:none; border:1px solid var(--rule); border-radius:6px; padding:5px 10px; white-space:nowrap; background:var(--panel)}
+.topbar .navbtn:hover{border-color:var(--faint)}
+.topbar .navbtn.disabled{opacity:.35; pointer-events:none}
+.topbar .menu{display:none}
+
+/* ---- layout: sidebar + column */
+.frame{max-width:1280px; margin:0 auto; padding:0 20px; display:grid; grid-template-columns:1fr; gap:0}
+@media (min-width:1180px){ .frame{grid-template-columns:230px minmax(0,1fr); gap:40px} }
+.side{display:none}
+@media (min-width:1180px){
+  .side{display:block; position:sticky; top:64px; align-self:start; max-height:calc(100vh - 80px); overflow:auto; padding:22px 0 30px; font-family:var(--sans); font-size:13px}
+}
+.side .t{font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin:0 0 10px}
+.side ol{list-style:none; margin:0; padding:0}
+.side li{margin:0}
+.side a{display:flex; gap:9px; color:var(--ink); text-decoration:none; padding:5px 8px; border-radius:5px; line-height:1.35}
+.side a:hover{background:#f3f0e8}
+.side a.cur{background:#f0e6df; color:var(--accent); font-weight:600}
+.side a .n{color:var(--muted); font-variant-numeric:tabular-nums; min-width:20px; font-weight:400}
+.side .grp{font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); margin:14px 8px 4px}
+
+main{min-width:0; padding:6px 0 60px}
+article{max-width:var(--col); margin:0 auto}
+
+/* ---- chapter head */
+.kicker{font-family:var(--mono); font-size:12.5px; letter-spacing:.18em; text-transform:uppercase; color:var(--muted); margin:38px 0 0}
+.kicker em{font-style:normal; color:var(--accent)}
+h1{font-size:44px; line-height:1.1; font-weight:600; letter-spacing:-.014em; margin:14px 0 12px; text-wrap:balance; font-variant-numeric:lining-nums}
+.lede{font-size:22px; font-style:italic; color:var(--muted); line-height:1.42; margin:0 0 14px}
+.byline{font-family:var(--mono); font-size:13px; color:var(--muted); margin:12px 0 0; padding-bottom:24px; border-bottom:1px solid var(--rule)}
+.byline em{font-style:normal; color:var(--accent)}
+h2{font-size:28px; font-weight:600; line-height:1.25; margin:56px 0 14px; text-wrap:balance; font-variant-numeric:lining-nums; letter-spacing:-.005em}
+h2 .no{color:var(--accent); font-weight:500; margin-right:10px; font-variant-numeric:lining-nums}
+h3{font-size:21px; font-weight:600; line-height:1.3; margin:36px 0 10px}
+p{margin:0 0 18px}
+ul,ol{margin:0 0 18px; padding-left:26px}
+li{margin-bottom:8px}
+hr{border:none; border-top:1px solid var(--rule); margin:44px 0}
+.small{font-size:16px; color:var(--muted)}
+
+code{font-family:var(--mono); font-size:.8em; background:var(--codebg); padding:1.5px 5px; border-radius:4px; font-variant-numeric:lining-nums}
+pre{background:var(--codebg); border:1px solid var(--rule); border-radius:8px; padding:16px 18px; overflow-x:auto; margin:8px 0 22px; line-height:1.55; font-size:14.5px}
+pre code{background:none; padding:0; font-size:14.5px}
+pre,code{font-feature-settings:"liga" 0,"calt" 0; font-variant-ligatures:none}
+.k{color:var(--purple)} .n{color:var(--green)} .c{color:#8d867a; font-style:italic} .f{color:var(--blue)} .s{color:var(--orange)} .hl{background:#fbe9c8; border-radius:3px}
+
+/* ---- asides, key sentence, numbers */
+.aside{border-left:3px solid var(--accent); background:var(--asidebg); border-radius:0 8px 8px 0; padding:16px 20px 4px; margin:26px 0}
+.aside .t{font-family:var(--mono); font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); margin-bottom:8px}
+.aside p{font-size:17px; line-height:1.58}
+.key{border:1px solid #e8d3c8; background:#fbf4ef; border-radius:8px; padding:18px 22px 6px; margin:28px 0}
+.key .t{font-family:var(--mono); font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); margin-bottom:8px}
+.key p{font-size:18.5px}
+.ledger{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:26px 0}
+.ledger .cell{border:1px solid var(--rule); border-radius:8px; padding:14px 16px 12px; background:var(--panel)}
+.ledger .cell .l{font-family:var(--sans); font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted)}
+.ledger .cell .v{font-family:var(--sans); font-size:26px; font-weight:600; line-height:1.15; margin-top:6px; font-variant-numeric:lining-nums; letter-spacing:-.01em}
+.ledger .cell .v small{font-size:14px; font-weight:500; color:var(--muted); margin-left:4px}
+.ledger .cell .d{font-family:var(--sans); font-size:13px; color:var(--muted); margin-top:6px}
+.ledger .cell.good .v{color:var(--green)} .ledger .cell.bad .v{color:var(--red)} .ledger .cell.acc .v{color:var(--accent)}
+
+table{border-collapse:collapse; margin:8px 0 22px; font-size:16.5px; width:100%; font-variant-numeric:lining-nums tabular-nums}
+th{font-family:var(--sans); font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:500; text-align:left; padding:8px 14px 8px 0; border-bottom:1px solid var(--ink)}
+td{padding:7px 14px 7px 0; border-bottom:1px solid var(--rule); vertical-align:top}
+td:last-child,th:last-child{padding-right:0}
+.tablewrap{overflow-x:auto}
+
+/* ---- figures (animations) */
+figure{margin:32px 0 36px}
+figure.wide{width:min(var(--wide),100%); margin-left:0}
+@media (min-width:1180px){ figure.wide{margin-left:calc((var(--col) - var(--wide))/2)} }
+@media (min-width:1500px){ figure.wide{width:1040px; margin-left:calc((var(--col) - 1040px)/2)} }
+figcaption{font-family:var(--serif); font-size:15.5px; color:var(--muted); line-height:1.5; margin-top:10px; padding:0 4px}
+figcaption b{color:var(--ink); font-weight:600}
+.anim{background:var(--panel); border:1px solid var(--rule); border-radius:10px; overflow:hidden; outline:none; position:relative}
+.anim:focus-visible{box-shadow:0 0 0 3px #e8d3c8}
+.anim-svg{display:block; width:100%; height:auto; background:#fff}
+.anim-svg text{font-family:var(--sans)}
+.anim-svg .f-sans{font-family:var(--sans)}
+.anim-svg .f-mono{font-family:var(--mono)}
+.anim-svg .f-serif{font-family:var(--serif)}
+.anim-bar{display:flex; align-items:center; gap:8px; padding:8px 10px; border-top:1px solid var(--rule); background:#faf9f5; font-family:var(--sans)}
+.ab-btn{appearance:none; border:1px solid var(--rule); background:#fff; color:var(--ink); border-radius:6px; width:30px; height:28px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; padding:0; font:600 11px var(--sans)}
+.ab-btn:hover{border-color:var(--faint); background:#fffdf8}
+.ab-btn svg{width:13px; height:13px; fill:var(--ink)}
+.ab-play{background:var(--ink); border-color:var(--ink)}
+.ab-play svg{fill:#fff}
+.ab-speed{width:38px; color:var(--muted)}
+.ab-track{flex:1; position:relative; height:28px; display:flex; align-items:center}
+.ab-range{width:100%; margin:0; appearance:none; -webkit-appearance:none; height:4px; background:#e3dfd4; border-radius:2px; outline:none; cursor:pointer}
+.ab-range::-webkit-slider-thumb{-webkit-appearance:none; width:14px; height:14px; border-radius:50%; background:var(--accent); border:2px solid #fff; box-shadow:0 0 0 1px var(--accent); cursor:pointer}
+.ab-range::-moz-range-thumb{width:12px; height:12px; border-radius:50%; background:var(--accent); border:2px solid #fff; box-shadow:0 0 0 1px var(--accent); cursor:pointer}
+.ab-ticks{position:absolute; left:7px; right:7px; top:50%; height:0; pointer-events:none}
+.ab-ticks i{position:absolute; top:-6px; width:2px; height:12px; margin-left:-1px; background:var(--faint); border-radius:1px; opacity:.85}
+.ab-step{font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; min-width:44px; text-align:right}
+.anim-cap{display:flex; gap:12px; padding:12px 16px 13px; font-family:var(--serif); font-size:16.5px; line-height:1.5; color:var(--ink); border-top:1px solid var(--rule); min-height:64px; background:#fff}
+.anim-cap .ac-no{font-family:var(--sans); font-weight:600; font-size:12px; color:#fff; background:var(--accent); border-radius:10px; min-width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; margin-top:3px; flex:none}
+.anim-cap .ac-text b{font-weight:600}
+.anim-cap code{font-size:.78em}
+.anim-hero{border:none; background:transparent; border-radius:0}
+.anim-hero .anim-svg{background:transparent}
+
+/* ---- footer nav */
+.pager{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:60px 0 10px; font-family:var(--sans)}
+.pager a{display:block; border:1px solid var(--rule); border-radius:10px; padding:14px 16px; text-decoration:none; color:var(--ink); background:var(--panel)}
+.pager a:hover{border-color:var(--faint)}
+.pager a .dir{font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted)}
+.pager a .ttl{font-size:16px; font-weight:600; margin-top:4px; line-height:1.3}
+.pager a.next{text-align:right}
+.pager .empty{border:none}
+.colophon{margin-top:44px; border-top:1px solid var(--rule); padding-top:18px; font-family:var(--sans); font-size:13px; color:var(--muted); line-height:1.55}
+.colophon a{color:var(--muted)}
+
+/* ---- cover page */
+.cover{max-width:var(--wide); margin:0 auto; padding:30px 0 20px}
+.cover h1{font-size:56px; margin:6px 0 14px}
+.cover .lede{font-size:24px}
+.cover-grid{display:grid; grid-template-columns:1fr; gap:14px; margin:30px 0 10px; font-family:var(--sans)}
+@media (min-width:760px){ .cover-grid{grid-template-columns:1fr 1fr} }
+.chap{display:block; border:1px solid var(--rule); border-radius:10px; padding:16px 18px 14px; text-decoration:none; color:var(--ink); background:var(--panel); position:relative}
+.chap:hover{border-color:var(--faint); box-shadow:0 1px 0 rgba(0,0,0,.02)}
+.chap .n{font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted)}
+.chap .ttl{font-size:18px; font-weight:600; margin:4px 0 6px; line-height:1.25; letter-spacing:-.01em}
+.chap .sum{font-family:var(--serif); font-size:15.5px; color:var(--muted); line-height:1.45}
+.chap .pct{position:absolute; right:16px; top:14px; font-size:13px; font-weight:600; color:var(--accent); font-variant-numeric:tabular-nums}
+.chap.part{grid-column:1/-1; background:transparent; border:none; padding:14px 0 0}
+.chap.part .n{color:var(--accent)}
+.howto{border:1px solid var(--rule); background:var(--asidebg); border-radius:10px; padding:18px 22px 8px; margin:26px 0; font-size:17px}
+.howto .t{font-family:var(--mono); font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin-bottom:8px}
+
+@media (max-width:640px){
+  body{font-size:17px}
+  h1{font-size:34px} .cover h1{font-size:38px}
+  h2{font-size:24px}
+  .lede{font-size:19px}
+  .topbar .where{display:none}
+  .anim-cap{font-size:15px}
+}
+::selection{background:#f0d9c9}

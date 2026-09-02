@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a Matmul Kernel Gets Fast · an animated book</title>
+<meta name="description" content="Ten CUDA kernels take one matrix multiply from 1.3% of the hardware to 93.7%. An animated book that shows where every byte and every instruction goes.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame" style="grid-template-columns:1fr">
+<main>
+<div class="cover">
+
+<div class="kicker">Vizuara · GPU notes · <em>an animated book</em></div>
+<h1>How a Matmul Kernel Gets Fast</h1>
+<p class="lede">Ten kernels take one matrix multiply from 1.3% of the hardware to 93.7%. This book animates every step: where the bytes go, where the instructions go, and why each rewrite changes the number.</p>
+<div class="byline">After Simon Boehm's <em>CUDA matmul worklog</em> · every measurement his, on an NVIDIA A6000 · a sequel to <a href="https://vizuaraai.github.io/cuda-programming-model/">The CUDA Programming Model</a></div>
+
+<figure class="wide" style="margin-left:0;width:100%">
+  <div id="hero"></div>
+</figure>
+
+<p>Multiplying two matrices is the most-run operation in machine learning, and on a GPU the obvious way to write it uses about one percent of the chip. Getting to ninety-three percent takes ten rewrites of the same forty lines. None of them changes the arithmetic. Every one of them changes how numbers travel: from the memory chips, through the caches and the shared scratchpad, into registers, and finally into the units that multiply.</p>
+
+<p>That is a story about movement, and movement is hard to follow in still pictures. So this book is built out of animations. Each chapter takes one kernel (or one idea the next kernel needs) and shows it running: tiles leaving global memory, sectors arriving whole whether you wanted them or not, a warp's 32 threads asking for 32 addresses at once, a register holding sixteen numbers and producing sixty-four multiply-adds. The prose explains; the animation is the argument.</p>
+
+<div class="howto">
+  <div class="t">How to read this book</div>
+  <p>Every animation plays on its own when it scrolls into view, and loops. Under each one is a caption that changes as the animation moves: that caption is the narration, and the numbered steps are the real structure of the argument. Use the <b>⏮ ⏭</b> buttons (or the arrow keys, after clicking an animation) to move one step at a time, and drag the slider to scrub. Nothing is a video; every frame is computed, so you can stop anywhere and read the numbers off it.</p>
+  <p>The numbers are real. The small matrices are an actual 8 × 8 integer product, the byte counts follow from how DRAM serves 32-byte sectors, and the speeds are Simon Boehm's measurements. Where the book predicts a speedup from first principles and then quotes the measurement, both numbers are given so you can see how close the reasoning lands.</p>
+</div>
+
+<h2 style="margin-top:48px">Contents</h2>
+<p class="small">Three foundation chapters, then one chapter per kernel. Percentages are each kernel's speed as a fraction of cuBLAS, NVIDIA's own library. If you already know what a warp and a sector are, start at chapter 4.</p>
+<div class="cover-grid"></div>
+
+<div class="colophon">Built by Vizuara, September 2026. Route and measurements: Simon Boehm, <a href="https://siboehm.com/articles/22/CUDA-MMM">How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog</a>, and the <a href="https://github.com/siboehm/SGEMM_CUDA">SGEMM_CUDA</a> repository. Hardware model: Stephen Jones, <em>How CUDA Programming Works</em> (GTC 2022), and the CUDA C++ Programming Guide. The animations are plain SVG driven by a small timeline engine; there are no videos and no external libraries.</div>
+
+</div>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+  // The cover animation: data flowing through the hierarchy while a tile of C is computed.
+  const S = MB.scene('hero', { w: 960, h: 420, hero: true, holdEnd: 0.6, title: 'Tiles of A and B flow from global memory through shared memory and registers into the FMA units' });
+  const tl = S.tl;
+
+  // hierarchy boxes
+  const GM = S.membox({ x: 40, y: 300, w: 880, h: 96, label: 'global memory (DRAM) — 48 GB, hundreds of cycles away', labelPos: 'bottom', labelSize: 13, fill: '#f1f0ec', stroke: '#b3afa4', rx: 14 });
+  const SM = S.membox({ x: 250, y: 24, w: 460, h: 236, label: 'one streaming multiprocessor (SM)', labelPos: 'top', labelSize: 12.5, fill: '#fbfaf7', stroke: '#c9c4bb', rx: 14 });
+  const SMEM = S.membox({ x: 274, y: 154, w: 412, h: 86, label: 'shared memory — 48 KB per block, on the SM', labelPos: 'bottom', labelSize: 12, fill: K.purplefill, stroke: K.purple, rx: 10 });
+  const REG = S.membox({ x: 274, y: 62, w: 190, h: 74, label: 'registers — private to a thread', labelPos: 'bottom', labelSize: 11.5, fill: K.goldfill, stroke: K.gold, rx: 10 });
+  const FMA = S.membox({ x: 496, y: 62, w: 190, h: 74, label: 'FP32 lanes — a × b + c', labelPos: 'bottom', labelSize: 11.5, fill: K.tealfill, stroke: K.teal, rx: 10 });
+  // arrows between levels
+  S.arrow({ x1: 480, y1: 296, x2: 480, y2: 246, stroke: '#9b978d', sw: 1.6 });
+  S.arrow({ x1: 369, y1: 150, x2: 369, y2: 142, stroke: '#9b978d', sw: 1.6 });
+  S.arrow({ x1: 470, y1: 99, x2: 490, y2: 99, stroke: '#9b978d', sw: 1.6 });
+  S.text({ x: 492, y: 275, text: 'tiles, once', size: 11, fill: K.muted });
+  S.text({ x: 376, y: 146, text: 'a row and a column', size: 10.5, fill: K.muted });
+
+  // the matrices sitting in global memory
+  const A = S.tile({ x: 70, y: 318, rows: 6, cols: 6, cell: 8, gap: 1, fill: K.Afill, stroke: K.A, label: 'A', labelSize: 11 });
+  const B = S.tile({ x: 150, y: 318, rows: 6, cols: 6, cell: 8, gap: 1, fill: K.Bfill, stroke: K.B, label: 'B', labelSize: 11 });
+  const Cm = S.tile({ x: 800, y: 318, rows: 6, cols: 6, cell: 8, gap: 1, fill: '#f6f3ee', stroke: '#d8d2c6', label: 'C', labelSize: 11, labelFill: K.C });
+  const Cdone = S.tile({ x: 800, y: 318, rows: 6, cols: 6, cell: 8, gap: 1, fill: K.Cfill, stroke: K.C, opacity: 0 });
+
+  // travelling tiles
+  const aT = S.tile({ x: 70, y: 318, rows: 2, cols: 6, cell: 8, gap: 1, fill: K.Afill, stroke: K.A, opacity: 0, frameStroke: K.A, frameFill: '#fff' });
+  const bT = S.tile({ x: 150, y: 318, rows: 6, cols: 2, cell: 8, gap: 1, fill: K.Bfill, stroke: K.B, opacity: 0, frameStroke: K.B, frameFill: '#fff' });
+  const aS = S.tile({ x: 300, y: 170, rows: 2, cols: 6, cell: 8, gap: 1, fill: K.Afill, stroke: K.A, opacity: 0 });
+  const bS = S.tile({ x: 380, y: 170, rows: 6, cols: 2, cell: 8, gap: 1, fill: K.Bfill, stroke: K.B, opacity: 0 });
+  const aR = S.tile({ x: 300, y: 170, rows: 1, cols: 4, cell: 9, gap: 1, fill: K.Afill, stroke: K.A, opacity: 0, frameStroke: K.A, frameFill: '#fff' });
+  const bR = S.tile({ x: 380, y: 170, rows: 4, cols: 1, cell: 9, gap: 1, fill: K.Bfill, stroke: K.B, opacity: 0, frameStroke: K.B, frameFill: '#fff' });
+  const cR = S.tile({ x: 380, y: 78, rows: 4, cols: 4, cell: 9, gap: 1, fill: '#fff', stroke: '#e0d9cf', opacity: 0 });
+  const cT = S.tile({ x: 590, y: 80, rows: 2, cols: 2, cell: 9, gap: 1, fill: K.Cfill, stroke: K.C, opacity: 0, frameStroke: K.C, frameFill: '#fff' });
+  const lanes = S.threads({ x: 514, y: 76, n: 16, size: 8, gap: 2.5, perRow: 8, fill: '#c7dfda', stroke: 'none' });
+
+  // loop: A,B tiles go up to shared memory; slices go to registers; lanes fire; C tile goes down
+  tl.show([aT, bT], 0.2);
+  tl.move(aT, 300, 170, 1.1, { at: '<', arc: -40 });
+  tl.move(bT, 380, 170, 1.1, { at: '<', arc: 40 });
+  tl.show([aS, bS], 0.2); tl.hide([aT, bT], 0.01, { at: '<' });
+  tl.set(aT, { tx: 70, ty: 318 }); tl.set(bT, { tx: 150, ty: 318 });
+  tl.wait(0.3);
+  // registers pull slices
+  for (let i = 0; i < 3; i++) {
+    tl.set(aR, { tx: 300, ty: 170 + i * 9 }); tl.set(bR, { tx: 380 + i * 9, ty: 170 });
+    tl.show([aR, bR], 0.15);
+    tl.move(aR, 292, 78 + 40, 0.5, { at: '<', arc: 20 });
+    tl.move(bR, 350, 74, 0.5, { at: '<', arc: -20 });
+    tl.show(cR, 0.2, { at: '<' });
+    // lanes light up and a C tile forms
+    tl.to(lanes.items, { fill: K.teal }, 0.08, { stagger: 0.02 });
+    tl.to(cR.cells, { fill: K.Cfill, stroke: K.C }, 0.12, { at: '<', stagger: 0.012 });
+    tl.to(lanes.items, { fill: '#c7dfda' }, 0.25, { at: '<+0.3' });
+    tl.hide([aR, bR], 0.15, { at: '<' });
+    tl.to(cR.cells, { fill: '#fff', stroke: '#e0d9cf' }, 0.2, { at: '<+0.2' });
+  }
+  tl.hide(cR, 0.2);
+  // finished C tile travels back down to global memory
+  tl.set(cT, { tx: 590, ty: 80 });
+  tl.show(cT, 0.2);
+  tl.move(cT, 800, 318, 1.1, { at: '<', arc: -50 });
+  tl.show(Cdone, 0.25); tl.hide(cT, 0.01, { at: '<' });
+  tl.hide([aS, bS], 0.3, { at: '<' });
+  tl.wait(0.5);
+  tl.hide(Cdone, 0.3);
+  S.finish();
+})();
+</script>
+</body>
+</html>

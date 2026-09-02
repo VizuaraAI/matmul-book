@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why kernel 3 disappointed: the bottleneck moved · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 7 · <em>The memory-starved kernels</em></div>
+<h1>Why kernel 3 disappointed: the bottleneck moved</h1>
+<p class="lede">A 32× cut in memory traffic bought 1.5× in speed. That gap is not something to shrug at. It is the most useful measurement in the book, because it says exactly where the time went instead.</p>
+<div class="byline">Hinge · <em>kernel 3 at 2,980 GFLOP/s</em> · 9.9% of the 30 TFLOP/s peak · the resource that ran out next</div>
+
+<p>Kernel 3 cut its global-memory traffic by a factor of 32 and got 1.5× for it: 1,986 to 2,980 GFLOP/s. If global memory had still been the limit, a 32× cut would have produced something close to a 32× speedup. It didn't, so global memory was no longer what the kernel was waiting on. Something else became the limit while we were busy fixing DRAM, and this chapter finds it. Everything from kernel 4 onward is an attack on what we find here.</p>
+
+<p>The tool is the only rule that ever matters in this business: <em>a kernel's running time is set by whichever resource runs out first.</em> So take the resources one at a time and ask, for each of them, how much of it a single multiply-add costs. Three candidates are left now that DRAM is out of the picture: the instruction issue slots, the shared-memory pipeline, and the arithmetic units themselves.</p>
+
+<h2><span class="no">7.1</span>Count the instructions</h2>
+
+<p>Here is kernel 3's inner loop again, and underneath it, roughly what the compiler turns it into. One line of C++ becomes three machine instructions: two loads from shared memory and one fused multiply-add. (The real machine code also carries address arithmetic and loop control; the compiler unrolls the loop to amortize those. The three instructions below are the part that scales with the work.)</p>
+
+<pre><code>tmp += As[threadRow * 32 + d] * Bs[d * 32 + threadCol];
+
+<span class="s">LDS</span>   R2, [As + threadRow*128 + d*4]     <span class="c">// load one word from shared memory</span>
+<span class="s">LDS</span>   R3, [Bs + d*128 + threadCol*4]     <span class="c">// load one word from shared memory</span>
+<span class="f">FFMA</span>  R1, R2, R3, R1                     <span class="c">// R1 = R2 × R3 + R1   (tmp, in a register)</span></code></pre>
+
+<p>Now the hardware side, from chapter 3. An SM has four warp schedulers, and each can issue one instruction per clock. That is the entire budget: four instructions per cycle, for everything the SM does. Each scheduler drives 32 FP32 lanes, and those lanes can accept a new multiply-add every cycle. If two out of every three instructions a warp issues are loads, then at most one cycle in three carries an FFMA, and the lanes can never be more than a third busy, before anyone has waited for anything.</p>
+
+<figure class="wide">
+  <div id="a-issue"></div>
+  <figcaption><b>Figure 7.1.</b> One warp scheduler running kernel 3's inner loop. It issues one instruction per clock; the lanes only fire on the FFMA, which is every third instruction. Four schedulers per SM, same pattern.</figcaption>
+</figure>
+
+<h2><span class="no">7.2</span>Count the words shared memory can serve</h2>
+
+<p>The second limit points the same way. Shared memory is built from 32 <em>banks</em>, and each bank can hand out one 4-byte word per cycle. Consecutive words live in consecutive banks, so a warp that reads 32 consecutive words touches all 32 banks once and is served in a single cycle. That is the best case, and kernel 3's read of Bs is exactly it: thread t reads Bs[d][t]. Its read of As is the other happy case: all 32 threads of the warp want the same word (they share a threadRow), so one bank answers and the value is broadcast.</p>
+
+<p>Add it up for the whole SM. Shared memory can supply 32 words per cycle, at most. The 128 lanes, if they were all doing multiply-adds every cycle, would want two words each: 256 words per cycle. Supply is an eighth of demand. So even ignoring instruction issue entirely, operand supply alone caps this loop near 16 multiply-adds per cycle, an eighth of the machine's arithmetic peak. Counting the broadcast on As, which costs one bank instead of 32, the cap is nearer a quarter. Kernel 3 measures 2,980 GFLOP/s against a 30,000 peak: 9.9%. It is pressed right up against that wall.<span class="snref">1</span></p>
+<span class="sn"><span class="no">1</span>This is deliberately the simplest model: it ignores bank conflicts and latency hiding, and it treats every cycle as available. It is not meant to predict the number, only to show which resource the kernel is leaning on.</span>
+
+<figure class="wide">
+  <div id="a-banks"></div>
+  <figcaption><b>Figure 7.2.</b> Shared memory's 32 banks, one word per bank per cycle. Kernel 3's two reads are conflict-free, and it doesn't matter: the SM can move 32 words a cycle and the lanes could use 256.</figcaption>
+</figure>
+
+<h2><span class="no">7.3</span>Where kernel 3 actually spends its time</h2>
+
+<p>Boehm's profiler confirms the diagnosis directly. The dominant reason its warps are stalled is what NVIDIA calls <em>MIO throttle</em>: warps queueing for the memory-input/output pipeline, which is the path shared-memory instructions take. Not waiting on DRAM, and not waiting on busy arithmetic units. The data is close by now. What costs is that reaching for it burns an instruction slot and a bank access every single time.</p>
+
+<div class="ledger">
+  <div class="cell bad"><div class="l">Instruction mix</div><div class="v">2 : 1</div><div class="d">loads to multiply-adds, per unit of work</div></div>
+  <div class="cell bad"><div class="l">Ceiling from issue slots</div><div class="v">33%</div><div class="d">at most one FFMA in three cycles</div></div>
+  <div class="cell bad"><div class="l">Ceiling from bank supply</div><div class="v">12–25%</div><div class="d">32 words/cycle against 256 wanted</div></div>
+  <div class="cell"><div class="l">Measured</div><div class="v">9.9%</div><div class="d">2,980 of 30,000 GFLOP/s</div></div>
+</div>
+
+<p>It is tempting to blame occupancy instead. Kernel 3 runs one block of 1,024 threads per SM, which is 32 of the 48 warp slots: 66%. That sounds like the sort of number that explains a slow kernel. It isn't, and the cleanest evidence comes two chapters from now: kernel 5 will have <em>lower</em> occupancy than kernel 3 and run five times faster. Chapter 10 does the occupancy arithmetic properly. For now, the honest reading of the profiler is that the warps that are resident are stuck in a queue for shared memory, and adding more warps to the queue would not shorten it.</p>
+
+<h2><span class="no">7.4</span>The other thing wrong with the loop</h2>
+
+<p>Look at the loop one more time. Every iteration reads <code>tmp</code>, adds to it, and writes it back. The next iteration cannot start its addition until the previous one has produced its result, because they use the same register. That is a dependency chain, 32 links long per chunk, and a fused multiply-add takes about four cycles to deliver its answer. With one accumulator, a thread can never have more than one multiply-add in flight.</p>
+
+<figure class="wide">
+  <div id="a-chain"></div>
+  <figcaption><b>Figure 7.3.</b> Eight multiply-adds through one accumulator, against eight through eight independent ones. The arithmetic is identical; only the second version lets the scheduler overlap them.</figcaption>
+</figure>
+
+<p>Kernel 4 will hand each thread eight independent accumulators, which the scheduler can keep in flight together. That is a second, quieter reason it goes faster than its load count alone predicts, and it is worth noticing now so the next chapter's measurement doesn't look like magic.</p>
+
+<h2><span class="no">7.5</span>The number to watch</h2>
+
+<p>All three findings point at the same ratio: how many shared-memory loads the kernel spends for each multiply-add. Kernel 3 spends two. The supply side says what the ratio would have to be for the lanes to stay busy: 32 words per cycle divided by 128 multiply-adds per cycle is 0.25 loads per FMA. That is the target, and it is eight times below where we are.</p>
+
+<figure class="wide">
+  <div id="a-metric"></div>
+  <figcaption><b>Figure 7.4.</b> Shared-memory loads per multiply-add, the metric the next two chapters drive down, with the supply line at 0.25 and the two kernels that will get there.</figcaption>
+</figure>
+
+<div class="key">
+  <div class="t">The hinge of the book</div>
+  <p>Kernels 4 and 5 are one question asked twice: <em>when can a single load serve more than one multiply-add?</em> The answer is in the definition of C, where the same operand shows up in many outputs. Give one thread several outputs that share an operand, and one load feeds all of them. Kernel 4 does this in one direction and reaches 1.125 loads per FMA. Kernel 5 does it in both and reaches 0.25.</p>
+</div>
+
+<p>So the disappointment was worth having. It told us the memory system had stopped being the problem, which is what every chapter before this one was working toward, and it handed us the next problem with a number attached. The next chapter takes that number from 2 to 1.125, and the kernel from 12.8% to 36.5%.</p>
+
+<div class="pager"></div>
+<div class="colophon">The issue and bank models are the simplest ones that show which resource binds; they ignore bank conflicts, latency hiding and the compiler's unrolling. The instruction mix, the 2,980 GFLOP/s measurement and the MIO-throttle stall reason are Simon Boehm's, from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>; the four-scheduler, 32-bank, 128-lane SM is Ampere's, per NVIDIA's CUDA C++ Programming Guide.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 7.1 the issue slot
+  (function () {
+    const S = MB.scene('a-issue', { w: 900, h: 500, title: 'One warp scheduler issuing kernel 3’s inner loop' });
+    const tl = S.tl;
+    // left: the instruction stream
+    const cpp = S.text({ x: 40, y: 34, text: 'tmp += As[threadRow*32 + d] * Bs[d*32 + threadCol];', font: 'mono', size: 12.5, fill: K.ink });
+    const cppNote = S.text({ x: 40, y: 54, text: 'one line of C++  →  three machine instructions, repeated for d = 0 … 31', size: 11.5, fill: K.muted, opacity: 0 });
+    const SCH = S.membox({ x: 40, y: 80, w: 300, h: 44, label: 'warp scheduler 0 — issues 1 instruction per clock', labelPos: 'center', labelSize: 12, fill: K.greyfill, stroke: K.grey, rx: 8 });
+    const instrs = [];
+    const names = ['LDS   As', 'LDS   Bs', 'FFMA'];
+    for (let i = 0; i < 12; i++) {
+      const isF = i % 3 === 2;
+      const y = 150 + i * 24;
+      const g = S.group({ tx: 40, ty: y, opacity: 0 });
+      g.rect({ x: 0, y: -10, w: 300, h: 21, fill: isF ? K.tealfill : '#fff', stroke: isF ? K.teal : K.rule, rx: 4 });
+      g.text({ x: 12, y: 0.5, text: names[i % 3], font: 'mono', size: 12, fill: isF ? K.teal : K.ink, weight: isF ? 600 : 400 });
+      g.text({ x: 288, y: 0.5, text: isF ? 'arithmetic' : 'operand fetch', anchor: 'end', size: 10.5, fill: isF ? K.teal : K.muted });
+      instrs.push(g);
+    }
+    const ptr = S.text({ x: 24, y: 150, text: '▶', size: 12, fill: K.accent, opacity: 0 });
+    const cyc = S.counter({ x: 40, y: 458, label: 'clock cycle', value: 0, size: 22 });
+    // right: the lanes
+    const LB = S.membox({ x: 400, y: 80, w: 460, h: 130, label: '32 FP32 lanes of this scheduler — can do one FMA each, every cycle', labelPos: 'bottom', labelSize: 11.5, fill: '#fbfaf7', stroke: K.rule, rx: 10 });
+    const lanes = S.threads({ x: 424, y: 96, n: 32, size: 20, gap: 6.5, perRow: 16, fill: '#e7e4dc', stroke: '#cfcabf' });
+    const busy = S.counter({ x: 400, y: 236, label: 'cycles in which the lanes fired', value: 0, size: 20, format: v => MB.fmt(v) });
+    const of = S.counter({ x: 560, y: 236, label: 'cycles elapsed', value: 0, size: 20 });
+    const pct = S.counter({ x: 720, y: 236, label: 'lane utilization, at best', value: 0, size: 20, fill: K.red, format: v => v.toFixed(0) + '%' });
+    // bottom: four schedulers
+    const four = [];
+    for (let i = 0; i < 4; i++) {
+      const g = S.group({ tx: 400 + i * 116, ty: 300, opacity: 0 });
+      g.rect({ x: 0, y: 0, w: 104, h: 62, fill: '#fff', stroke: K.rule, rx: 8 });
+      g.text({ x: 52, y: 14, text: 'scheduler ' + i, anchor: 'middle', size: 10.5, fill: K.muted });
+      const t = S._threads(g.node, { x: 8, y: 26, n: 32, size: 4.2, gap: 1.3, perRow: 16, fill: '#e7e4dc' });
+      four.push({ g, t });
+    }
+    const fourNote = S.text({ x: 400, y: 386, text: '4 schedulers × 1 instruction per clock = the whole issue budget', size: 11.5, fill: K.ink, opacity: 0 });
+    const fourNote2 = S.text({ x: 400, y: 404, text: '2 of every 3 are loads → at most ⅓ of the 128 lanes ever busy', size: 11.5, fill: K.red, weight: 600, opacity: 0 });
+
+    tl.step('Kernel 3’s inner loop, as the machine sees it: one line of C++ becomes <b>two loads from shared memory</b> (LDS) and <b>one fused multiply-add</b> (FFMA). Then it repeats.');
+    tl.show(cppNote, 0.3);
+    tl.show(instrs.slice(0, 3), 0.25, { stagger: 0.15 });
+    tl.wait(1.6);
+
+    let fired = 0;
+    function cycle(i, dur, hold) {
+      tl.set(ptr, { opacity: 1 });
+      tl.to(ptr, { y: 150 + i * 24 }, 0.12);
+      tl.to(cyc.num, { value: i + 1 }, 0.1, { at: '<' });
+      tl.to(of.num, { value: i + 1 }, 0.1, { at: '<' });
+      if (i % 3 === 2) {
+        fired++;
+        tl.to(lanes.items, { fill: K.teal, stroke: K.teal }, 0.08, { at: '<' });
+        tl.to(busy.num, { value: fired }, 0.1, { at: '<' });
+        tl.to(pct.num, { value: 100 * fired / (i + 1) }, 0.15, { at: '<' });
+        tl.to(lanes.items, { fill: '#e7e4dc', stroke: '#cfcabf' }, 0.15, { at: '<+' + Math.max(0.12, dur * 0.55) });
+      } else {
+        tl.to(pct.num, { value: 100 * fired / (i + 1) }, 0.15, { at: '<' });
+      }
+      tl.wait(hold);
+    }
+    tl.step('Cycle 1: the scheduler issues the first LDS. The 32 lanes have nothing to do.');
+    cycle(0, 0.5, 1.4);
+    tl.step('Cycle 2: the second LDS. Still nothing for the lanes.');
+    cycle(1, 0.5, 1.4);
+    tl.step('Cycle 3: FFMA. All 32 lanes fire, once. One useful cycle out of three.');
+    cycle(2, 0.5, 1.6);
+    tl.step('Repeat. Over twelve cycles the lanes fire four times: <b>a third of the time at best</b>, and that is before anyone has waited for a load to arrive.');
+    tl.show(instrs.slice(3), 0.2, { stagger: 0.05 });
+    for (let i = 3; i < 12; i++) cycle(i, 0.32, 0.22);
+    tl.wait(1.0);
+
+    tl.step('An SM has <b>four</b> schedulers, each with 32 lanes. Four instructions per cycle is the whole issue budget for everything the SM does. Spend two of every three on loads, and at most a third of the 128 lanes can be busy.');
+    tl.show(four, 0.3, { stagger: 0.1 });
+    for (let c = 0; c < 6; c++) {
+      four.forEach((f, i) => {
+        const at = c === 0 && i === 0 ? undefined : '<';
+        tl.to(f.t.items, { fill: (c + i) % 3 === 2 ? K.teal : '#e7e4dc' }, 0.12, { at });
+      });
+      tl.wait(0.22);
+    }
+    tl.show([fourNote, fourNote2], 0.4);
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 7.2 the banks
+  (function () {
+    const S = MB.scene('a-banks', { w: 900, h: 480, title: 'Shared memory’s 32 banks' });
+    const tl = S.tl;
+    const bx = 60, by = 70, bw = 18, bgap = 6, bh = 96;
+    const SM = S.membox({ x: 40, y: 40, w: 820, h: 180, label: 'shared memory — 32 banks, one 4-byte word per bank per cycle', labelPos: 'topleft', labelSize: 12, fill: K.purplefill, stroke: K.purple, rx: 10 });
+    const banks = [], words = [];
+    for (let b = 0; b < 32; b++) {
+      const x = bx + b * (bw + bgap) + 4;
+      banks.push(S.rect({ x, y: by, w: bw, h: bh, fill: '#fff', stroke: '#c8bde3', rx: 3 }));
+      S.text({ x: x + bw / 2, y: by + bh + 10, text: '' + b, anchor: 'middle', size: 8.5, fill: K.muted });
+      const col = [];
+      for (let r = 0; r < 4; r++) col.push(S.rect({ x: x + 2, y: by + 4 + r * 22, w: bw - 4, h: 18, fill: '#f6f3fb', stroke: 'none', rx: 2 }));
+      words.push(col);
+    }
+    const wordLbl = S.text({ x: 448, y: 54, text: 'word w lives in bank w mod 32: row 0 = words 0…31, row 1 = 32…63, …', size: 11, fill: K.muted, opacity: 0 });
+    // the warp
+    const W = S.threads({ x: 60 + 4, y: 262, n: 32, size: 18, gap: 6, fill: '#5b5750' });
+    S.text({ x: 64, y: 250, text: 'one warp: 32 threads', size: 11, fill: K.muted });
+    const lines = [];
+    for (let t = 0; t < 32; t++) {
+      const [tx0, ty0] = W.center(t);
+      lines.push(S.line({ x1: tx0, y1: ty0 - 9, x2: tx0, y2: by + bh, stroke: K.B, sw: 1.2, opacity: 0 }));
+    }
+    const req = S.text({ x: 60, y: 300, text: '', font: 'mono', size: 12.5, fill: K.ink });
+    const reqNote = S.text({ x: 60, y: 320, text: '', size: 11.5, fill: K.muted });
+    // supply vs demand bars
+    const supply = S.bar({ x: 300, y: 360, w: 0, h: 16, fill: K.purplefill, stroke: K.purple, label: 'shared memory can supply', value: 0, format: v => MB.fmt(v) + ' words / cycle', opacity: 0 });
+    const demand = S.bar({ x: 300, y: 388, w: 0, h: 16, fill: K.tealfill, stroke: K.teal, label: '128 lanes want (2 per FMA)', value: 0, format: v => MB.fmt(v) + ' words / cycle', opacity: 0 });
+    const cap = S.text({ x: 60, y: 436, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const cap2 = S.text({ x: 60, y: 456, text: '', size: 11.5, fill: K.muted });
+
+    tl.step('Shared memory is built from <b>32 banks</b>. Each bank hands out one 4-byte word per cycle, and consecutive words live in consecutive banks.');
+    tl.show(wordLbl, 0.3);
+    tl.to(banks, { fill: '#ece6f7' }, 0.12, { stagger: 0.03 });
+    tl.to(words.map(c => c[0]), { fill: '#d9cdf0' }, 0.12, { at: '<', stagger: 0.03 });
+    tl.to(banks, { fill: '#fff' }, 0.3);
+    tl.wait(1.4);
+
+    tl.step('A warp reading <b>Bs[d][threadCol]</b>: thread t reads word t, so the 32 requests land in 32 different banks. Every bank answers at once. One cycle, no conflict.');
+    tl.set(req, { text: 'Bs[d][threadCol]   →   32 consecutive words' });
+    tl.set(reqNote, { text: '32 banks, 1 word each: served in 1 cycle (the best case)' });
+    tl.show(lines, 0.15, { stagger: 0.02 });
+    tl.to(words.map(c => c[1]), { fill: K.Bfill, stroke: K.B, sw: 1 }, 0.15, { at: '<+0.3', stagger: 0.02 });
+    tl.wait(1.6);
+    tl.hide(lines, 0.3);
+    tl.to(words.map(c => c[1]), { fill: '#f6f3fb', stroke: 'none' }, 0.3, { at: '<' });
+
+    tl.step('A warp reading <b>As[threadRow][d]</b>: every thread in the warp shares a threadRow, so all 32 want the <b>same</b> word. One bank answers, and the value is broadcast. Also one cycle.');
+    tl.set(req, { text: 'As[threadRow][d]   →   the same word for all 32 threads' });
+    tl.set(reqNote, { text: '1 bank, 1 word, broadcast to 32 threads: served in 1 cycle' });
+    const target = bx + 5 * (bw + bgap) + 4 + bw / 2;
+    lines.forEach((l, t) => tl.to(l, { x2: target, opacity: 1 }, 0.4, { at: t === 0 ? '>' : '<+0.015' }));
+    tl.to(words[5][2], { fill: K.Afill, stroke: K.A, sw: 1 }, 0.2);
+    tl.wait(1.6);
+    tl.hide(lines, 0.3);
+    lines.forEach((l, t) => tl.set(l, { x2: W.center(t)[0] }, '<'));
+    tl.to(words[5][2], { fill: '#f6f3fb', stroke: 'none' }, 0.3, { at: '<' });
+
+    tl.step('So the SM’s shared memory can deliver at most <b>32 words per cycle</b>. The 128 lanes, doing a multiply-add each with two loads apiece, would want <b>256</b>. Supply is an eighth of demand.');
+    tl.set(req, { text: '' }); tl.set(reqNote, { text: '' });
+    tl.show([supply, demand], 0.3);
+    supply.grow(tl, 60, 32, 0.6);
+    demand.grow(tl, 480, 256, 1.0);
+    tl.wait(1.4);
+
+    tl.step('That caps this loop near <b>16 multiply-adds per cycle</b>, an eighth of the machine — or about a quarter once the broadcast is counted. Measured: <b>9.9%</b>. Kernel 3 is pressed against shared-memory supply, not against DRAM.');
+    tl.set(cap, { text: 'supply ÷ demand:  32 / 256 = 12.5% of the lanes fed (2 words per FMA)   ·   ≈ 25% counting the As broadcast   ·   measured 9.9%' });
+    tl.set(cap2, { text: 'Boehm’s profiler: the dominant stall reason is “MIO throttle” — warps queueing for the shared-memory pipeline.' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 7.3 the dependency chain
+  (function () {
+    const S = MB.scene('a-chain', { w: 900, h: 400, title: 'One accumulator against eight' });
+    const tl = S.tl;
+    const x0 = 250, cyc = 18, LAT = 4;
+    // axis
+    S.text({ x: x0, y: 46, text: 'clock cycles →', size: 11, fill: K.muted });
+    for (let c = 0; c <= 32; c += 4) {
+      S.line({ x1: x0 + c * cyc, y1: 56, x2: x0 + c * cyc, y2: 330, stroke: '#eeebe3', sw: 1 });
+      S.text({ x: x0 + c * cyc, y: 344, text: '' + c, anchor: 'middle', size: 10, fill: K.muted });
+    }
+    S.text({ x: x0 - 14, y: 120, text: 'kernel 3', anchor: 'end', size: 13, fill: K.ink, weight: 600 });
+    S.text({ x: x0 - 14, y: 137, text: 'one accumulator', anchor: 'end', size: 11, fill: K.muted });
+    S.text({ x: x0 - 14, y: 236, text: 'kernel 4', anchor: 'end', size: 13, fill: K.ink, weight: 600 });
+    S.text({ x: x0 - 14, y: 253, text: 'eight accumulators', anchor: 'end', size: 11, fill: K.muted });
+    const serial = [], par = [];
+    for (let i = 0; i < 8; i++) {
+      const g = S.group({ tx: x0 + i * LAT * cyc, ty: 100, opacity: 0 });
+      g.rect({ x: 1, y: 0, w: LAT * cyc - 2, h: 30, fill: K.tealfill, stroke: K.teal, rx: 4 });
+      g.text({ x: LAT * cyc / 2, y: 15.5, text: 'FMA ' + (i + 1), anchor: 'middle', size: 10.5, fill: K.teal, weight: 600 });
+      serial.push(g);
+      const h = S.group({ tx: x0 + i * cyc, ty: 190 + i * 11, opacity: 0 });
+      h.rect({ x: 1, y: 0, w: LAT * cyc - 2, h: 9, fill: K.tealfill, stroke: K.teal, rx: 2 });
+      par.push(h);
+    }
+    const sDone = S.text({ x: x0 + 32 * cyc + 8, y: 115, text: '', size: 12, fill: K.red, weight: 600 });
+    const pDone = S.text({ x: x0 + 11 * cyc + 8, y: 240, text: '', size: 12, fill: K.green, weight: 600 });
+    const dep = S.text({ x: x0, y: 160, text: '', size: 11.5, fill: K.muted });
+    const dep2 = S.text({ x: x0, y: 300, text: '', size: 11.5, fill: K.muted });
+
+    tl.step('The loop has one running total, <code>tmp</code>. Each multiply-add must wait for the previous one to finish, because it adds to the same register.');
+    tl.wait(1.2);
+    tl.step('A fused multiply-add takes about <b>four cycles</b> to deliver its result. One accumulator means one FMA in flight at a time: eight of them take 32 cycles.');
+    serial.forEach((g, i) => { tl.show(g, 0.2, { at: i === 0 ? '>' : '<+0.32' }); });
+    tl.set(dep, { text: 'each FMA starts only when the previous result is ready: a chain 32 links long per chunk' });
+    tl.set(sDone, { text: '32 cycles' });
+    tl.wait(1.6);
+    tl.step('Give the thread <b>eight independent totals</b> and the scheduler can issue the next FMA before the previous one has finished. The same eight FMAs are done in 11 cycles.');
+    par.forEach((g, i) => { tl.show(g, 0.15, { at: i === 0 ? '>' : '<+0.1' }); });
+    tl.set(dep2, { text: 'no FMA waits for another: up to eight in flight, one issued per cycle' });
+    tl.set(pDone, { text: '11 cycles' });
+    tl.wait(1.6);
+    tl.step('Kernel 4 does exactly this. It is a second, quieter reason it will run faster than its load count alone predicts.');
+    tl.wait(2.6);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 7.4 the metric
+  (function () {
+    const S = MB.scene('a-metric', { w: 900, h: 380, title: 'Shared-memory loads per multiply-add' });
+    const tl = S.tl;
+    const x0 = 250, scale = 225; // px per 1.0 loads/FMA
+    S.text({ x: x0, y: 40, text: 'shared-memory loads per multiply-add', size: 13, fill: K.ink, weight: 600 });
+    for (let v = 0; v <= 2; v += 0.5) {
+      S.line({ x1: x0 + v * scale, y1: 54, x2: x0 + v * scale, y2: 290, stroke: '#eeebe3', sw: 1 });
+      S.text({ x: x0 + v * scale, y: 302, text: v.toFixed(v % 1 ? 2 : 0), anchor: 'middle', size: 10, fill: K.muted });
+    }
+    const k3 = S.bar({ x: x0, y: 80, w: 0, h: 22, fill: K.redfill, stroke: K.red, label: 'kernel 3', value: 0, format: v => v.toFixed(3) });
+    const k4 = S.bar({ x: x0, y: 150, w: 0, h: 22, fill: '#fff', stroke: K.A, label: 'kernel 4 (chapter 8)', value: 0, format: v => v.toFixed(3), opacity: 0 });
+    const k5 = S.bar({ x: x0, y: 220, w: 0, h: 22, fill: '#fff', stroke: K.B, label: 'kernel 5 (chapter 9)', value: 0, format: v => v.toFixed(3), opacity: 0 });
+    k4.rect.setNow({ dash: '5 4' }); k5.rect.setNow({ dash: '5 4' });
+    const sup = S.line({ x1: x0 + 0.25 * scale, y1: 60, x2: x0 + 0.25 * scale, y2: 290, stroke: K.purple, sw: 2, dash: '6 4', opacity: 0 });
+    const supL = S.text({ x: x0 + 0.25 * scale + 8, y: 64, text: 'what 32 words/cycle can feed 128 lanes: 0.25', size: 11.5, fill: K.purple, weight: 600, opacity: 0 });
+    const m3 = S.text({ x: 860, y: 91, text: '', anchor: 'end', size: 12, fill: K.muted });
+    const m4 = S.text({ x: 860, y: 161, text: '', anchor: 'end', size: 12, fill: K.muted });
+    const m5 = S.text({ x: 860, y: 231, text: '', anchor: 'end', size: 12, fill: K.muted });
+    const note = S.text({ x: x0, y: 340, text: '', size: 12.5, fill: K.ink, weight: 600 });
+
+    tl.step('The number to watch from here on: <b>shared-memory loads per multiply-add</b>. Kernel 3 spends two.');
+    k3.grow(tl, 2 * scale, 2, 0.9);
+    tl.set(m3, { text: '2,980 GFLOP/s' });
+    tl.wait(1.4);
+    tl.step('What the supply can sustain if all 128 lanes are to stay busy: 32 words per cycle ÷ 128 FMAs per cycle = <b>0.25</b>. Eight times below where we are.');
+    tl.show([sup, supL], 0.4);
+    tl.wait(1.6);
+    tl.step('Kernel 4 gets to <b>1.125</b> by making one loaded B value serve eight multiply-adds: nine loads, eight FMAs.');
+    tl.show(k4, 0.2); k4.grow(tl, 1.125 * scale, 1.125, 0.8);
+    tl.set(m4, { text: '8,475 GFLOP/s' });
+    tl.wait(1.4);
+    tl.step('Kernel 5 gets to <b>0.25</b> with an 8 × 8 patch of outputs per thread: sixteen loads, sixty-four FMAs. The next two chapters are that one idea, applied twice.');
+    tl.show(k5, 0.2); k5.grow(tl, 0.25 * scale, 0.25, 0.8);
+    tl.set(m5, { text: '15,972 GFLOP/s' });
+    tl.set(note, { text: 'the mirror image: as loads per FMA fall 2 → 1.125 → 0.25, speed rises 2,980 → 8,475 → 15,972 GFLOP/s' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

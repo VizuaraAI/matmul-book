@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel 6: vectorized memory access · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 11 · <em>The last mile</em></div>
+<h1>Kernel 6: vectorized memory access</h1>
+<p class="lede">Four 32-bit loads become one 128-bit load, and a transposed shared-memory tile makes that legal for A as well as B. The bytes don't change; the instruction count does.</p>
+<div class="byline">Kernel · <em>sgemmVectorize</em> · 18,237 GFLOP/s · 78.4% of cuBLAS · measured by Simon Boehm on an NVIDIA A6000</div>
+
+<p>From here the remaining gains are smaller and more specialist. Kernel 5 got us to 68.7% of cuBLAS, and chapter 7's diagnosis has largely been answered: the shared-memory traffic per multiply-add is at the supply line, DRAM stopped being the limit three kernels ago. What is left to trim is instructions. We are close enough to the arithmetic limit that every load instruction the scheduler issues is a slot it didn't spend on an FFMA, and this chapter is about issuing fewer of them for the same bytes.</p>
+
+<h2><span class="no">11.1</span>Four loads or one</h2>
+
+<p>A thread that needs four consecutive floats can get them with four 32-bit load instructions, or with one 128-bit load instruction. The bytes that move are identical, sixteen either way. The instruction count is four times lower, and instruction issue is now part of what limits us. CUDA exposes the wide load through the <code>float4</code> type: a struct of four floats that the hardware moves as a unit.</p>
+
+<figure class="wide">
+  <div id="a-float4"></div>
+  <figcaption><b>Figure 11.1.</b> The same sixteen bytes fetched as four scalar loads and as one vector load. The wide form has one condition: the address must sit on a 16-byte boundary, so that the four floats are the four of one aligned group.</figcaption>
+</figure>
+
+<p>There is a catch, and it is why the change needs an explicit cast in the source rather than a compiler flag. The compiler cannot know that a pointer someone hands it is 16-byte aligned, and a 128-bit load from an unaligned address is illegal. So Boehm's kernel 6 tells it, with <code>reinterpret_cast&lt;float4*&gt;</code>: a promise that this address is a multiple of sixteen, which the tile layout guarantees. With that promise the compiler emits <code>LDG.E.128</code> for global loads and <code>LDS.128</code> for shared-memory loads instead of four <code>LDG.E</code> or four <code>LDS</code>.</p>
+
+<pre><code><span class="c">// global → shared, four floats of A at a time (transposed on the way in)</span>
+<span class="k">float4</span> tmp = <span class="f">reinterpret_cast</span>&lt;<span class="k">float4</span> *&gt;(&amp;A[innerRowA * K + innerColA * <span class="n">4</span>])[<span class="n">0</span>];
+As[(innerColA * <span class="n">4</span> + <span class="n">0</span>) * BM + innerRowA] = tmp.x;
+As[(innerColA * <span class="n">4</span> + <span class="n">1</span>) * BM + innerRowA] = tmp.y;
+As[(innerColA * <span class="n">4</span> + <span class="n">2</span>) * BM + innerRowA] = tmp.z;
+As[(innerColA * <span class="n">4</span> + <span class="n">3</span>) * BM + innerRowA] = tmp.w;
+
+<span class="c">// global → shared, four floats of B at a time, no transpose needed</span>
+<span class="f">reinterpret_cast</span>&lt;<span class="k">float4</span> *&gt;(&amp;Bs[innerRowB * BN + innerColB * <span class="n">4</span>])[<span class="n">0</span>] =
+    <span class="f">reinterpret_cast</span>&lt;<span class="k">float4</span> *&gt;(&amp;B[innerRowB * N + innerColB * <span class="n">4</span>])[<span class="n">0</span>];</code></pre>
+
+<h2><span class="no">11.2</span>Why As has to be stored transposed</h2>
+
+<p>Look at the four lines that store <code>tmp</code>. They don't write the four floats next to each other; they scatter them into four different rows of As, one per value of k. That is the subtlety of this kernel, and the reason is in kernel 5's inner loop. Each step of k, the thread copies its eight A operands into registers by walking <em>down a column</em> of As: regM[i] = As[(threadRow × 8 + i) × BK + dotIdx]. In kernel 5's layout, rows of As are 8 floats long, so those eight values are 32 bytes apart from each other. Not contiguous, so not a vector load. Eight separate LDS instructions, every step.</p>
+
+<p>Store As transposed, k-major instead of m-major, and the column walk becomes a row walk: the eight values a thread wants for a given k are now eight neighbors, which is exactly two <code>LDS.128</code>. Bs never had the problem, because regN reads along a row of Bs to begin with. The animation shows both layouts as the one-dimensional memory they really are.</p>
+
+<figure class="wide">
+  <div id="a-transpose"></div>
+  <figcaption><b>Figure 11.2.</b> The thread's eight A operands for one step of k, in kernel 5's layout and in kernel 6's transposed layout. Same eight numbers; scattered 32 bytes apart in one, contiguous in the other. Contiguous is what makes a 128-bit load legal.</figcaption>
+</figure>
+
+<p>The price of the transpose is paid on the way in. Each thread loads four consecutive floats of A from global memory with one wide load, but then has to write them to four different rows of As with four scalar stores, because the four values it fetched belong to four different k. B pays nothing: four floats in, one wide store out. It is a good trade, because the global-to-shared copy happens once per chunk while the shared-to-register copy happens eight times per chunk, once per k.</p>
+
+<figure class="wide">
+  <div id="a-gmem"></div>
+  <figcaption><b>Figure 11.3.</b> The cooperative load in kernel 6. A is fetched four floats at a time and scattered into the transposed tile; B is fetched and stored four at a time. Per thread per chunk: two wide global loads where kernel 5 had eight scalar ones.</figcaption>
+</figure>
+
+<h2><span class="no">11.3</span>What it bought</h2>
+
+<p>Count the instructions in one step of k, per thread. Kernel 5 issues eight loads for regM, eight for regN, and sixty-four FFMAs: eighty instructions, of which 80% are arithmetic. Kernel 6 issues two wide loads for regM, two for regN, and the same sixty-four FFMAs: sixty-eight instructions, 94% arithmetic. The bytes read from shared memory are unchanged. Only the number of times the scheduler has to say "load" went down.</p>
+
+<figure class="wide">
+  <div id="a-count"></div>
+  <figcaption><b>Figure 11.4.</b> Instructions per step of k, per thread, before and after vectorizing. The arithmetic doesn't change; the overhead around it shrinks by three quarters.</figcaption>
+</figure>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Shared loads per k-step</div><div class="v">16 → 4</div><div class="d">scalar LDS → LDS.128</div></div>
+  <div class="cell"><div class="l">Global loads per chunk</div><div class="v">8 → 2</div><div class="d">per thread: LDG.E → LDG.E.128</div></div>
+  <div class="cell"><div class="l">Arithmetic share of issue</div><div class="v">80 → 94%</div><div class="d">64 FFMA of 80 → of 68</div></div>
+  <div class="cell good"><div class="l">Measured</div><div class="v">18,237</div><div class="d">from 15,972 GFLOP/s, +14%</div></div>
+</div>
+
+<p>Boehm measured the two halves of the change separately. Transposing As so that its loads vectorize was worth about 500 GFLOP/s on its own, around 3%; the wide global loads and stores account for the rest of the 14%. Here is what the change looks like at the machine-code level, in his listing: the shared-memory reads that used to be single-word loads become pairs of 128-bit ones.</p>
+
+<pre><code><span class="c">// before (PTX): one word at a time</span>
+ld.shared.f32   %f91, [%r8+3456];
+
+<span class="c">// after (SASS): sixteen bytes at a time</span>
+LDS.128 R8,  [R2]
+LDS.128 R12, [R2+0x20]</code></pre>
+
+<p>That is the end of the changes that come from reasoning about the memory system directly. The kernel now moves close to the minimum bytes, at close to the minimum instruction count, in the layout the hardware wants. What remains is that it has five free parameters, and nobody knows which combination of them is best for this particular chip. The next chapter stops reasoning and starts measuring.</p>
+
+<div class="pager"></div>
+<div class="colophon">The float4 code, the SASS excerpt, the roughly 500 GFLOP/s attributed to the As transpose and the 15,972 → 18,237 GFLOP/s measurement are Simon Boehm's, from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a> and the kernel-6 source in his repository; the instruction counts per k-step follow from kernel 5's and kernel 6's inner loops with TM = TN = 8.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 11.1 four loads or one
+  (function () {
+    const S = MB.scene('a-float4', { w: 900, h: 440, title: 'Four scalar loads against one 128-bit load' });
+    const tl = S.tl;
+    const cw = 30, x0 = 60;
+    const vals = MB.intMatrix(1, 16, 21, 1, 9)[0];
+    function tapeRow(y, label) {
+      const T = S.tape({ x: x0, y, n: 16, cell: cw, h: 24, label });
+      const vt = vals.map((v, i) => S.text({ x: x0 + i * cw + cw / 2, y: y + 12, text: '' + v, anchor: 'middle', size: 11, fill: K.ink }));
+      for (let i = 0; i <= 16; i += 4) S.line({ x1: x0 + i * cw, y1: y - 6, x2: x0 + i * cw, y2: y + 30, stroke: K.grey, sw: 1.4 });
+      return { T, vt };
+    }
+    S.text({ x: x0, y: 40, text: 'memory (row-major floats); thick marks every 16 bytes = every 4 floats', size: 11.5, fill: K.muted });
+    const A = tapeRow(60, 'scalar');
+    const B = tapeRow(210, 'vector');
+    const regA = S.threads({ x: 640, y: 62, n: 4, size: 22, gap: 6, fill: '#fff', stroke: K.gold, label: 'registers', labelPos: 'top' });
+    const regB = S.threads({ x: 640, y: 212, n: 4, size: 22, gap: 6, fill: '#fff', stroke: K.gold, label: 'registers', labelPos: 'top' });
+    const iA = S.counter({ x: 780, y: 60, label: 'instructions', value: 0, size: 22 });
+    const bA = S.counter({ x: 780, y: 108, label: 'bytes', value: 0, size: 16 });
+    const iB = S.counter({ x: 780, y: 210, label: 'instructions', value: 0, size: 22, fill: K.green });
+    const bB = S.counter({ x: 780, y: 258, label: 'bytes', value: 0, size: 16 });
+    const nA = S.text({ x: x0, y: 130, text: '', font: 'mono', size: 12, fill: K.ink });
+    const nB = S.text({ x: x0, y: 280, text: '', font: 'mono', size: 12, fill: K.ink });
+    const note = S.text({ x: x0, y: 330, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: x0, y: 352, text: '', size: 12, fill: K.muted });
+    const badRing = S.rect({ x: x0 + 6 * cw - 2, y: 210 - 4, w: 4 * cw + 4, h: 32, fill: 'none', stroke: K.red, sw: 2, rx: 3, dash: '5 4', opacity: 0 });
+    // flyers
+    const fA = [], fB = S.tile({ x: 0, y: 0, rows: 1, cols: 4, cell: cw - 2, gap: 2, fill: K.Afill, stroke: K.A, frameStroke: K.A, frameFill: '#fff', opacity: 0 });
+    for (let i = 0; i < 4; i++) fA.push(S.tile({ x: 0, y: 0, rows: 1, cols: 1, cell: cw - 2, gap: 0, fill: K.Afill, stroke: K.A, frameStroke: K.A, frameFill: '#fff', opacity: 0 }));
+
+    tl.step('A thread needs four consecutive floats, positions 4 to 7. The scalar way: <b>four load instructions</b>, one float each.');
+    tl.to(A.T.cells.slice(4, 8), { fill: K.Afill, stroke: K.A }, 0.2, { stagger: 0.05 });
+    tl.set(nA, { text: 'LDG.E  R0, [p+16]   ·   LDG.E  R1, [p+20]   ·   LDG.E  R2, [p+24]   ·   LDG.E  R3, [p+28]' });
+    for (let i = 0; i < 4; i++) {
+      const [sx, sy] = A.T.center(4 + i), [rx, ry] = regA.center(i);
+      tl.set(fA[i], { tx: sx - (cw - 2) / 2, ty: sy - (cw - 2) / 2, opacity: 1 });
+      tl.move(fA[i], rx - (cw - 2) / 2, ry - (cw - 2) / 2, 0.5, { arc: -30 });
+      tl.to(regA.items[i], { fill: K.Afill }, 0.15, { at: '<+0.45' });
+      tl.hide(fA[i], 0.05, { at: '<' });
+      tl.to(iA.num, { value: i + 1 }, 0.15, { at: '<' });
+      tl.to(bA.num, { value: (i + 1) * 4 }, 0.15, { at: '<' });
+    }
+    tl.wait(1.4);
+
+    tl.step('The vector way: <b>one</b> 128-bit load, <code>float4</code>, that fetches all four at once. Same sixteen bytes, one instruction.');
+    tl.to(B.T.cells.slice(4, 8), { fill: K.Afill, stroke: K.A }, 0.2, { stagger: 0.05 });
+    tl.set(nB, { text: 'LDG.E.128  R0, [p+16]        (R0, R1, R2, R3 filled together)' });
+    { const [sx, sy] = B.T.center(4), [rx, ry] = regB.center(0);
+      tl.set(fB, { tx: sx - (cw - 2) / 2, ty: sy - (cw - 2) / 2, opacity: 1 });
+      tl.move(fB, rx - (cw - 2) / 2, ry - (cw - 2) / 2, 0.6, { arc: -30 });
+      tl.to(regB.items, { fill: K.Afill }, 0.15, { at: '<+0.55', stagger: 0.03 });
+      tl.hide(fB, 0.05, { at: '<' });
+      tl.to(iB.num, { value: 1 }, 0.15, { at: '<' });
+      tl.to(bB.num, { value: 16 }, 0.15, { at: '<' }); }
+    tl.wait(1.6);
+
+    tl.step('The condition: a float4 must start on a <b>16-byte boundary</b>, so its four floats are one aligned group. Positions 4–7 qualify. Positions 6–9 straddle a boundary and cannot be one vector load.');
+    tl.show(badRing, 0.3);
+    tl.to(B.T.cells.slice(6, 10), { stroke: K.red }, 0.3, { at: '<' });
+    tl.set(note, { text: 'the compiler cannot see alignment through an arbitrary pointer — reinterpret_cast<float4*> is the programmer’s promise' });
+    tl.set(note2, { text: 'kernel 6’s tiles are laid out so that every thread’s four floats are an aligned group' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 11.2 the transpose
+  (function () {
+    const S = MB.scene('a-transpose', { w: 900, h: 540, title: 'Why As is stored transposed in kernel 6' });
+    const tl = S.tl;
+    const cw = 12;
+    // kernel 5 layout: As[m][k], 128 x 8 (show 16 rows), memory order = row by row of 8
+    S.text({ x: 40, y: 34, text: 'kernel 5: As[m][k] — 128 rows of 8, m-major', size: 13, fill: K.ink, weight: 600 });
+    const M5 = S.matrix({ x: 40, y: 50, rows: 16, cols: 8, cell: cw, stroke: '#c8bde3', sw: 0.6, label: '', labelSize: 11 });
+    S.text({ x: 40 + 8 * cw + 8, y: 50 + 8 * cw, text: '← k (8)', size: 10.5, fill: K.muted });
+    S.text({ x: 40 + 4 * cw, y: 50 + 16 * cw + 12, text: 'm ↓ (128 rows, 16 shown)', anchor: 'middle', size: 10.5, fill: K.muted });
+    const T5 = S.tape({ x: 220, y: 70, n: 64, cell: 10, h: 18, label: 'as memory', opacity: 1 });
+    S.text({ x: 220, y: 52, text: 'shared memory, floats 0 … 63 (rows m = 0 … 7 of As)', size: 11, fill: K.muted });
+    for (let i = 8; i < 64; i += 8) S.line({ x1: 220 + i * 10, y1: 66, x2: 220 + i * 10, y2: 92, stroke: K.purple, sw: 1 });
+    const n5 = S.text({ x: 220, y: 112, text: '', font: 'mono', size: 11.5, fill: K.ink });
+    const n5b = S.text({ x: 220, y: 132, text: '', size: 11.5, fill: K.red, weight: 600 });
+    // kernel 6 layout: As[k][m], 8 x 128 (show 8 x 32)
+    S.text({ x: 40, y: 290, text: 'kernel 6: As[k][m] — 8 rows of 128, k-major (transposed)', size: 13, fill: K.ink, weight: 600 });
+    const M6 = S.matrix({ x: 40, y: 306, rows: 8, cols: 32, cell: cw, stroke: '#c8bde3', sw: 0.6 });
+    S.text({ x: 40 + 32 * cw + 8, y: 306 + 4 * cw, text: '← m (128, 32 shown)', size: 10.5, fill: K.muted });
+    S.text({ x: 40 - 6, y: 306 + 4 * cw, text: 'k ↓', anchor: 'end', size: 10.5, fill: K.muted });
+    const T6 = S.tape({ x: 220, y: 430, n: 64, cell: 10, h: 18, label: 'as memory' });
+    S.text({ x: 220, y: 412, text: 'shared memory, floats 256 … 319 (row k = 2 of the transposed As)', size: 11, fill: K.muted });
+    const n6 = S.text({ x: 220, y: 472, text: '', font: 'mono', size: 11.5, fill: K.ink });
+    const n6b = S.text({ x: 220, y: 492, text: '', size: 11.5, fill: K.green, weight: 600 });
+    const d = 2;
+
+    tl.step('One thread’s eight A operands for step k = 2: rows m = 0 … 7 of As, column k = 2. In kernel 5’s layout that is a <b>column</b> of the tile.');
+    tl.to(M5.block(0, d, 8, 1), { fill: K.Afill, stroke: K.A, sw: 1 }, 0.2, { stagger: 0.05 });
+    tl.set(n5, { text: 'regM[i] = As[(m0 + i) * 8 + 2]     i = 0 … 7' });
+    tl.wait(1.4);
+    tl.step('Shared memory is one line of floats, row after row. Those eight values sit at positions 2, 10, 18 … 58: <b>32 bytes apart</b>. Not contiguous, so eight separate loads.');
+    for (let i = 0; i < 8; i++) tl.to(T5.cells[i * 8 + d], { fill: K.Afill, stroke: K.A, sw: 1 }, 0.15, { at: i === 0 ? '>' : '<+0.08' });
+    tl.set(n5b, { text: '8 × LDS (one float each), every step of k' });
+    tl.wait(1.8);
+    tl.step('Kernel 6 stores As <b>transposed</b>: k-major. The same eight values now lie in one row of the tile, m = 0 … 7 of row k = 2.');
+    tl.to(M6.block(d, 0, 1, 8), { fill: K.Afill, stroke: K.A, sw: 1 }, 0.2, { stagger: 0.05 });
+    tl.set(n6, { text: 'regM[i] = As[2 * 128 + m0 + i]     i = 0 … 7' });
+    tl.wait(1.4);
+    tl.step('In memory that is positions 256 … 263: <b>eight neighbors, 32 contiguous bytes</b>, which is exactly two float4 loads.');
+    tl.to(T6.cells.slice(0, 8), { fill: K.Afill, stroke: K.A, sw: 1 }, 0.15, { stagger: 0.05 });
+    tl.set(n6b, { text: '2 × LDS.128 (four floats each), every step of k' });
+    tl.wait(1.4);
+    tl.step('Bs never had the problem: regN reads along a row of Bs, which was contiguous already. So after the transpose, all four register loads per step are 128-bit.');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 11.3 the global load
+  (function () {
+    const S = MB.scene('a-gmem', { w: 900, h: 470, title: 'The vectorized cooperative load of kernel 6' });
+    const tl = S.tl;
+    const cw = 14;
+    const GM = S.membox({ x: 40, y: 300, w: 820, h: 140, label: 'global memory', labelPos: 'topleft', labelSize: 12, fill: '#f1f0ec', stroke: '#b3afa4', rx: 10 });
+    const Ag = S.matrix({ x: 70, y: 330, rows: 4, cols: 16, cell: cw, stroke: '#cfcabf', sw: 0.6, label: 'A, rows m = 0 … 3, columns k = 0 … 15', labelSize: 10.5, labelPos: 'bottom' });
+    const Bg = S.matrix({ x: 520, y: 330, rows: 4, cols: 16, cell: cw, stroke: '#cfcabf', sw: 0.6, label: 'B, rows k = 0 … 3, columns n = 0 … 15', labelSize: 10.5, labelPos: 'bottom' });
+    const SM = S.membox({ x: 40, y: 40, w: 820, h: 200, label: 'shared memory', labelPos: 'topleft', labelSize: 12, fill: K.purplefill, stroke: K.purple, rx: 10 });
+    const As = S.matrix({ x: 70, y: 76, rows: 8, cols: 16, cell: cw, stroke: '#c8bde3', sw: 0.6, label: 'As transposed: rows k = 0 … 7, columns m', labelSize: 10.5, labelPos: 'bottom' });
+    const Bs = S.matrix({ x: 520, y: 76, rows: 8, cols: 16, cell: cw, stroke: '#c8bde3', sw: 0.6, label: 'Bs: rows k = 0 … 7, columns n', labelSize: 10.5, labelPos: 'bottom' });
+    const cA = S.counter({ x: 350, y: 76, label: 'A: instructions', value: 0, size: 16, format: v => v === 0 ? '—' : v + '' });
+    const cAn = S.text({ x: 350, y: 120, text: '', size: 10.5, fill: K.muted });
+    const cB = S.counter({ x: 350, y: 150, label: 'B: instructions', value: 0, size: 16, format: v => v === 0 ? '—' : v + '' });
+    const cBn = S.text({ x: 350, y: 194, text: '', size: 10.5, fill: K.muted });
+    const fA = S.tile({ x: 0, y: 0, rows: 1, cols: 4, cell: cw - 2, gap: 2, fill: K.Afill, stroke: K.A, frameStroke: K.A, frameFill: '#fff', opacity: 0 });
+    const fAs = [0, 1, 2, 3].map(() => S.tile({ x: 0, y: 0, rows: 1, cols: 1, cell: cw - 2, gap: 0, fill: K.Afill, stroke: K.A, opacity: 0 }));
+    const fB = S.tile({ x: 0, y: 0, rows: 1, cols: 4, cell: cw - 2, gap: 2, fill: K.Bfill, stroke: K.B, frameStroke: K.B, frameFill: '#fff', opacity: 0 });
+    const m = 2, k0 = 4;
+    const note = S.text({ x: 40, y: 262, text: '', size: 12, fill: K.ink, weight: 600 });
+
+    tl.step('This thread’s share of A for the chunk: four consecutive floats of one row, A[m = 2][k = 4 … 7]. One <b>LDG.E.128</b> brings all four.');
+    tl.to(Ag.block(m, k0, 1, 4), { fill: K.Afill, stroke: K.A }, 0.2, { stagger: 0.05 });
+    { const [sx, sy] = Ag.corner(m, k0);
+      tl.set(fA, { tx: sx + 1, ty: sy + 1, opacity: 1 });
+      tl.move(fA, 300, 250, 0.7, { arc: -60 });
+      tl.to(cA.num, { value: 1 }, 0.2, { at: '<+0.5' });
+      tl.set(cAn, { text: '1 × LDG.E.128 (16 bytes)' }, '<'); }
+    tl.wait(1.2);
+    tl.step('But the four values belong to four different k, and As is k-major. So they scatter into <b>four rows</b> of As, column m = 2: four scalar stores. That is the price of the transpose.');
+    for (let i = 0; i < 4; i++) {
+      const [tx, ty] = As.corner(k0 + i, m);
+      tl.set(fAs[i], { tx: 300 + i * (cw), ty: 250, opacity: 1 }, i === 0 ? '>' : '<');
+    }
+    tl.hide(fA, 0.05, { at: '<' });
+    for (let i = 0; i < 4; i++) {
+      const [tx, ty] = As.corner(k0 + i, m);
+      tl.move(fAs[i], tx + 1, ty + 1, 0.5, { at: i === 0 ? '>' : '<+0.12', arc: 20 });
+      tl.to(As.cellAt(k0 + i, m), { fill: K.Afill, stroke: K.A }, 0.15, { at: '<+0.45' });
+      tl.hide(fAs[i], 0.05, { at: '<' });
+    }
+    tl.to(cA.num, { value: 5 }, 0.3);
+    tl.set(cAn, { text: '1 × LDG.E.128 + 4 × STS (scalar)' }, '<');
+    tl.wait(1.6);
+    tl.step('B is easy. The thread’s four floats of B, B[k = 1][n = 8 … 11], are a row in both places: one <b>LDG.E.128</b> in, one <b>STS.128</b> out.');
+    tl.to(Bg.block(1, 8, 1, 4), { fill: K.Bfill, stroke: K.B }, 0.2, { stagger: 0.05 });
+    { const [sx, sy] = Bg.corner(1, 8), [tx, ty] = Bs.corner(1, 8);
+      tl.set(fB, { tx: sx + 1, ty: sy + 1, opacity: 1 });
+      tl.move(fB, tx + 1, ty + 1, 0.8, { arc: 60 });
+      tl.to(Bs.block(1, 8, 1, 4), { fill: K.Bfill, stroke: K.B }, 0.15, { at: '<+0.7', stagger: 0.03 });
+      tl.hide(fB, 0.05, { at: '<' });
+      tl.to(cB.num, { value: 2 }, 0.3, { at: '<' });
+      tl.set(cBn, { text: '1 × LDG.E.128 + 1 × STS.128' }, '<'); }
+    tl.wait(1.4);
+    tl.step('Per thread per chunk: <b>two</b> wide global loads where kernel 5 issued eight scalar ones. The copy happens once per chunk; the register loads it enables happen eight times per chunk.');
+    tl.set(note, { text: 'kernel 5: 4 LDG + 4 LDG per chunk  →  kernel 6: 1 LDG.128 + 4 STS + 1 LDG.128 + 1 STS.128' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 11.4 instruction count
+  (function () {
+    const S = MB.scene('a-count', { w: 900, h: 400, title: 'Instructions per k-step per thread, kernel 5 against kernel 6' });
+    const tl = S.tl;
+    const x0 = 250, W = 560, max = 80, h = 26;
+    function row(y, name) {
+      S.text({ x: x0 - 12, y: y + h / 2, text: name, anchor: 'end', size: 13, fill: K.ink, weight: 600 });
+      const l = S.rect({ x: x0, y, w: 0, h, fill: K.redfill, stroke: K.red, rx: 3 });
+      const f = S.rect({ x: x0, y, w: 0, h, fill: K.tealfill, stroke: K.teal, rx: 3 });
+      const lt = S.text({ x: x0, y: y + h + 14, text: '', size: 11, fill: K.red, weight: 600 });
+      const ft = S.text({ x: x0 + 200, y: y + h + 14, text: '', size: 11, fill: K.teal, weight: 600 });
+      const tot = S.text({ x: x0 + W, y: y - 9, text: '', anchor: 'end', size: 12, fill: K.ink, weight: 600 });
+      return { l, f, lt, ft, tot };
+    }
+    S.text({ x: x0, y: 40, text: 'instructions per step of k, per thread', size: 13, fill: K.ink, weight: 600 });
+    const r5 = row(70, 'kernel 5'), r6 = row(170, 'kernel 6');
+    const note = S.text({ x: 40, y: 290, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 312, text: '', size: 12, fill: K.muted });
+    const res = S.text({ x: 40, y: 350, text: '', size: 13, fill: K.accent, weight: 600 });
+    function fill(r, loads, dur) {
+      const lw = W * loads / max, fw = W * 64 / max;
+      tl.to(r.l, { width: lw }, dur);
+      tl.to(r.f, { x: x0 + lw, width: fw }, dur, { at: '<' });
+      tl.set(r.lt, { text: loads + ' loads' }); tl.set(r.ft, { text: '64 FFMA' }, '<');
+      tl.set(r.tot, { text: (loads + 64) + ' instructions · ' + Math.round(100 * 64 / (loads + 64)) + '% arithmetic' }, '<');
+    }
+    tl.step('Kernel 5, one step of k: eight scalar loads for regM, eight for regN, sixty-four FFMAs. Eighty instructions; <b>80% arithmetic</b>.');
+    fill(r5, 16, 0.9);
+    tl.wait(1.6);
+    tl.step('Kernel 6: two 128-bit loads for regM, two for regN, the same sixty-four FFMAs. Sixty-eight instructions; <b>94% arithmetic</b>. The bytes moved are identical.');
+    fill(r6, 4, 0.9);
+    tl.wait(1.6);
+    tl.step('Measured: <b>15,972 → 18,237 GFLOP/s</b>, +14%. Boehm found the transpose of As worth about 500 GFLOP/s of that on its own, roughly 3%; the wide global loads and stores account for the rest.');
+    tl.set(note, { text: 'shared-memory bytes per step: 64 in both kernels · load instructions: 16 → 4' });
+    tl.set(note2, { text: 'global loads per thread per chunk: 8 scalar → 2 wide (plus the scatter stores for the transposed As)' });
+    tl.set(res, { text: '15,972 → 18,237 GFLOP/s  ·  68.7% → 78.4% of cuBLAS' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

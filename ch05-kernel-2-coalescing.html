@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel 2: memory coalescing · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 5 · <em>The memory-starved kernels</em></div>
+<h1>Kernel 2: memory coalescing</h1>
+<p class="lede">Two index lines change. The loop, the arithmetic and the thread count stay exactly as they were, and the kernel runs 6.4 times faster.</p>
+<div class="byline">Kernel · <em>sgemm_global_mem_coalesce</em> · 1,986 GFLOP/s · 8.5% of cuBLAS · measured by Simon Boehm on an NVIDIA A6000</div>
+
+<p>Chapter 4 ended with a diagnosis rather than a fix. Kernel 1 moved 1,056 bytes for every 64 FLOPs, and the reason had nothing to do with the arithmetic or the loop. It was that the 32 threads of a warp asked for 32 floats sitting in 32 different rows of A, and memory serves whole 32-byte sectors whether you wanted them or not. Thirty-two addresses, thirty-two sectors.</p>
+
+<p>This chapter changes the addresses and nothing else.</p>
+
+<h2><span class="no">5.1</span>Two lines change</h2>
+
+<p>Here is kernel 2. Two lines differ from kernel 1 — the highlighted ones — and everything below them is untouched.</p>
+
+<pre><code><span class="c">// one 1-D block of BLOCKSIZE * BLOCKSIZE = 1,024 threads, BLOCKSIZE = 32</span>
+<span class="k">const int</span> cRow = blockIdx.x * BLOCKSIZE + (<span class="hl">threadIdx.x / BLOCKSIZE</span>);   <span class="c">// row</span>
+<span class="k">const int</span> cCol = blockIdx.y * BLOCKSIZE + (<span class="hl">threadIdx.x % BLOCKSIZE</span>);   <span class="c">// column</span>
+
+<span class="k">if</span> (cRow &lt; M &amp;&amp; cCol &lt; N) {
+    <span class="k">float</span> tmp = <span class="n">0.0</span>;
+    <span class="k">for</span> (<span class="k">int</span> i = <span class="n">0</span>; i &lt; K; ++i)
+        tmp += A[cRow * K + i] * B[i * N + cCol];   <span class="c">// 2 loads, 2 FLOPs</span>
+    C[cRow * N + cCol] = alpha * tmp + beta * C[cRow * N + cCol];
+}</code></pre>
+
+<p>The block is one-dimensional now: 1,024 threads numbered 0 to 1,023. The kernel takes that single number and splits it in two. Divide by 32 and you get a row inside the 32 × 32 tile; take the remainder and you get a column. Threads 0 to 31 — which is warp 0 — all divide to 0 and leave remainders 0 through 31, so warp 0 owns row 0 of the tile, columns 0 to 31.</p>
+
+<p>Why <code>threadIdx.x</code> specifically? Because that's the index the hardware uses to build warps. Threads inside a block are numbered with <code>threadIdx.x</code> running fastest, and consecutive thread numbers are packed 32 at a time: threads 0 to 31 are warp 0, 32 to 63 are warp 1, and so on. Whatever <code>threadIdx.x</code> feeds becomes the thing that varies across a warp, and therefore the thing that decides what the warp's 32 addresses look like. In kernel 1 it fed the row of C, so the addresses walked down a column of A. Here it feeds the column, so they walk along a row of B.</p>
+
+<figure class="wide">
+  <div id="a-swap"></div>
+  <figcaption><b>Figure 5.1.</b> The only edit. Kernel 1 fed <code>threadIdx.x</code> into the row, and warp 0 landed in a column of the C tile; kernel 2 divides by 32 for the row and takes the remainder for the column, and the same warp lands in a row. The loop, the arithmetic and the thread count are identical on both sides.</figcaption>
+</figure>
+
+<p>Kernel 1 gave warp 0 thirty-two outputs too. It just stacked them vertically. Read as a rewrite this looks like nothing at all, and the difference only appears when you ask where the warp's 32 addresses land at the instant the load is issued — which is the only thing memory ever sees.</p>
+
+<h2><span class="no">5.2</span>The new request at k = 0</h2>
+
+<p>Take the first pass of the loop, i = 0, the same moment we watched in chapter 4.</p>
+
+<p>The load from A is <code>A[cRow * K + i]</code>, and every thread in warp 0 has <code>cRow = 0</code> and <code>i = 0</code>. All 32 addresses are the same address. The memory system fetches the sector holding A[0][0] once and broadcasts the value to all 32 threads: one sector, 32 bytes. It's the free case that B enjoyed in kernel 1, and now A gets it instead.</p>
+
+<p>The load from B is <code>B[i * N + cCol]</code>, and <code>cCol</code> runs 0, 1, 2, … 31 across the warp. Those are 32 consecutive floats of row 0 of B. Row-major storage puts consecutive elements of a row next to each other, so the request is one unbroken run of 128 bytes. A sector is 32 bytes and 128 divides by 32 exactly, so the run is precisely four sectors and every byte in all four is wanted by somebody. The four sectors divide the warp neatly: sector 0 holds B[0][0] through B[0][7], so it serves threads 0 to 7 and nobody else. Eight threads per sector, four sectors, thirty-two threads. Nothing travels for nothing.</p>
+
+<figure class="wide">
+  <div id="a-bytes2"></div>
+  <figcaption><b>Figure 5.2.</b> The byte bill for one k-step of one warp, drawn the way figure 4.3 was. A costs one sector and gets broadcast; B's 32 consecutive floats are 128 bytes, which is four whole sectors with nothing wasted. 160 bytes moved against kernel 1's 1,056, for the same 132 bytes wanted.</figcaption>
+</figure>
+
+<div class="ledger">
+  <div class="cell good"><div class="l">Bytes moved per warp-step</div><div class="v">160</div><div class="d">1 sector of A + 4 sectors of B; was 1,056</div></div>
+  <div class="cell"><div class="l">Bytes actually wanted</div><div class="v">132</div><div class="d">1 float of A + 32 floats of B; unchanged</div></div>
+  <div class="cell good"><div class="l">Useful fraction</div><div class="v">82.5<small>%</small></div><div class="d">it was 12.5% in kernel 1</div></div>
+  <div class="cell bad"><div class="l">Bytes per FLOP</div><div class="v">2.5</div><div class="d">was 16.5; the machine can feed about 0.03</div></div>
+</div>
+
+<p>The bytes the warp actually wants haven't changed. There are still 132 of them, because the warp is still doing the same 64 FLOPs on the same data. What changed is what the memory system had to move in order to deliver them: 1,056 bytes before, 160 now.</p>
+
+<h2><span class="no">5.3</span>Predict, then measure</h2>
+
+<p>1,056 ÷ 160 = 6.6.</p>
+
+<p>That number is a prediction, and I'd rather state it before looking at the answer. Chapter 4's claim was that kernel 1 is limited by memory and by nothing else — that the arithmetic units spend essentially all of their time waiting for bytes. If that's true, and if kernel 2 needs 6.6 times fewer bytes to do identical work, then kernel 2 should be about 6.6 times faster. Kernel 1 ran at 309 GFLOP/s, so we should see roughly 309 × 6.6 = 2,039.4.</p>
+
+<p>Boehm measures 1,986.5 GFLOP/s. That is a 6.4× speedup, and it sits within 3% of a number we got by counting sectors on paper.</p>
+
+<figure class="wide">
+  <div id="a-measure"></div>
+  <figcaption><b>Figure 5.3.</b> The prediction is made before the measurement, out of the byte bill alone: 2,039.4 predicted, 1,986.5 measured. The throughput bars underneath are drawn against the full 768 GB/s the A6000 can deliver, which is why they look so small.</figcaption>
+</figure>
+
+<p>This is the part of the worklog I'd point at first if someone asked why any of this is worth learning. Nothing was tuned here. No parameter was swept. A model said the kernel was starving for bytes in a particular shape, the shape got fixed, and the machine moved by almost exactly the factor the model predicted. Boehm's profiler confirms it from the other side too: useful memory throughput rises from about 15 GB/s to about 110 GB/s.</p>
+
+<p>Kernel 2 is 8.5% of cuBLAS. The naive kernel was 1.3%. That is what two index lines bought.</p>
+
+<h2><span class="no">5.4</span>What coalescing means</h2>
+
+<p>The name for what just happened is <em>memory coalescing</em>, and the name misleads a little. It sounds like something the hardware does for you, as though the GPU inspects your 32 addresses, notices they're neighbors, and cleverly merges them into a single request. It doesn't. The memory system does the same thing on every load it has ever served: it fetches whole 32-byte sectors, as many as it takes to cover the addresses it was handed. The only variable is how many that is, and that is decided entirely by your indexing.</p>
+
+<div class="key">
+  <div class="t">Key</div>
+  <p>Coalescing isn't an optimization the GPU performs. It's a property the 32 addresses of a warp either have or lack. Same hardware, same rule, different addresses, 6.4×.</p>
+</div>
+
+<p>Here is the same warp — 32 threads, one float each, 128 bytes wanted every time — at four different strides.</p>
+
+<figure class="wide">
+  <div id="a-patterns"></div>
+  <figcaption><b>Figure 5.4.</b> One warp, 32 threads, one float each, four strides. Blue cells are wanted; pale red cells travel anyway, because they share a sector with a wanted one. The warp wants exactly 128 bytes in all four cases.</figcaption>
+</figure>
+
+<p>Two things in that table are the ones to keep. The first is that the bytes the warp wants never change; only the bytes that move do. The second is that the damage tops out. At stride 1 the request is four sectors. At stride 2, eight. By stride 8 — that's 32 bytes, exactly one sector — each wanted float has a sector to itself, and you're at 32 sectors and 12.5% useful. Increasing the stride past that changes nothing at all: a column of A, whose neighbors are 16,368 bytes apart, costs the same 32 sectors as a stride of 8. Kernel 1's pattern wasn't bad because its stride was enormous. It was bad because its stride was one sector or more, which is all it takes to hit the floor.</p>
+
+<p>The practical version of this is short. Whatever a warp loads, look at what varies across its 32 threads, and check that the variation lands on consecutive addresses. An array indexed by <code>threadIdx.x</code> at unit stride is coalesced. The same array indexed by <code>threadIdx.x * 32</code> is not, and it will cost eight times the traffic no matter how carefully the rest of the kernel is written.</p>
+
+<h2><span class="no">5.5</span>Why not 768 GB/s yet</h2>
+
+<p>110 GB/s of useful throughput, on a part that can move 768. If every request is now the right shape, why isn't the kernel saturating the bus?</p>
+
+<p>Because the requests are the right shape and there are still far too many of them.</p>
+
+<p>Count what one block reads. A block computes a 32 × 32 tile of C, so between them its threads need 32 whole rows of A — a strip of 32 × 4,092 floats — and 32 whole columns of B. Now count the blocks. 4,092 ÷ 32 is 127.9, so there are 128 tiles along each edge of C and 16,384 blocks in all. Every one of the 128 blocks in the first row of tiles reads that same row strip of A. Each strip is fetched 128 times over, and every column strip of B gets the same treatment.</p>
+
+<p>That is only the redundancy between blocks. Inside a block it's worse: the thread that owns C[0][0] and the thread that owns C[0][1] both walk the whole of row 0 of A, so within one tile every value of A is read 32 times. That one is chapter 6's subject.</p>
+
+<p>Add it up and kernel 2 issues exactly the loads kernel 1 issued: 137 billion of them, 548 GB requested. Not a single load was removed. What changed is that the bytes now arrive in useful shapes, so far less pointless traffic is generated per load.</p>
+
+<figure class="wide">
+  <div id="a-rereads"></div>
+  <figcaption><b>Figure 5.5.</b> Why the kernel is nowhere near 768 GB/s. Each cell of the drawn C is one block; each drawn row of A is the row strip that block reads. Every block along a row of tiles re-reads the same strip of A — 128 times over in the real problem.</figcaption>
+</figure>
+
+<div class="aside">
+  <div class="t">Aside · what the L2 cache was hiding</div>
+  <p>If kernel 1 really pulled all 548 GB out of the memory chips at 768 GB/s, it would take 0.71 seconds, and 137 GFLOP in 0.71 seconds is 192 GFLOP/s. Kernel 1 measured 309, comfortably above that floor, which means a good share of those 137 billion loads never reached DRAM at all. The L2 cache served them, because 128 blocks were asking for the same strip. Caches soften a bad access pattern; they don't repair it. That is why kernel 1 still only got 1.3% of the machine, and why fixing the pattern was worth another 6.4× on top of everything the cache was already doing.</p>
+</div>
+
+<p>So the shape of each request is fixed and the number of requests is untouched. Kernel 3 goes after the number. It loads one tile of A and one tile of B into shared memory — the fast scratchpad on the SM that a whole block can read — and lets all 1,024 threads work out of that instead of going back to global memory 32 times each. That's the next chapter.</p>
+
+<div class="pager"></div>
+<div class="colophon">Every number in the animations is computed rather than typed in: the byte counts follow from 32-byte sectors and row-major layout, the tile counts from 4,092 ÷ 32, and the GFLOP/s and GB/s figures are Simon Boehm's A6000 measurements from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>. Kernel 2's source is <code>sgemm_global_mem_coalesce</code> in the <a href="https://github.com/siboehm/SGEMM_CUDA">SGEMM_CUDA</a> repository.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 5.1 two lines change
+  (function () {
+    const S = MB.scene('a-swap', { w: 900, h: 500, title: 'Kernel 2 swaps which index a thread takes, moving warp 0 from a column of C to a row' });
+    const tl = S.tl, c = 6;
+
+    const panel = S.rect({ x: 60, y: 34, w: 780, h: 96, fill: '#faf9f5', stroke: K.rule, sw: 1, rx: 8, opacity: 0 });
+    const kLbl = S.text({ x: 78, y: 54, text: 'kernel 1', size: 11, fill: K.muted, font: 'mono', opacity: 0 });
+    const L1 = S.text({ x: 78, y: 80, text: 'const uint x = blockIdx.x * blockDim.x + threadIdx.x;   // row of C', font: 'mono', size: 12.5, fill: K.ink, opacity: 0 });
+    const L2 = S.text({ x: 78, y: 104, text: 'const uint y = blockIdx.y * blockDim.y + threadIdx.y;   // column of C', font: 'mono', size: 12.5, fill: K.ink, opacity: 0 });
+    const note = S.text({ x: 78, y: 150, text: '', size: 12, fill: K.accent, weight: 600 });
+
+    const C = S.matrix({ x: 140, y: 190, rows: 32, cols: 32, cell: c, stroke: '#ddd9cf', sw: 0.5, label: 'one 32 × 32 tile of C', labelSize: 12, opacity: 0 });
+    const W = S.threads({ x: 140, y: 418, n: 32, size: 8, gap: 2.5, fill: '#5b5750', label: 'warp 0 = threads 0 … 31', labelPos: 'top', opacity: 0 });
+
+    const dots = [];
+    for (let i = 0; i < 32; i++) {
+      const [x, y] = W.center(i);
+      dots.push(S.circle({ cx: 0, cy: 0, r: 2.6, fill: K.C, opacity: 0, tx: x, ty: y }));
+    }
+
+    const asg = S.text({ x: 400, y: 200, text: '', size: 13, fill: K.C, weight: 600 });
+    const asgSub = S.text({ x: 400, y: 222, text: '', size: 11.5, fill: K.muted });
+    const blk = S.text({ x: 400, y: 260, text: 'one block = 1,024 threads = 32 warps', size: 11.5, fill: K.muted, opacity: 0 });
+    const aNote = S.text({ x: 400, y: 308, text: '', size: 12, fill: K.A, weight: 600 });
+    const aNote2 = S.text({ x: 400, y: 328, text: '', size: 11, fill: K.muted });
+    const bNote = S.text({ x: 400, y: 358, text: '', size: 12, fill: K.B, weight: 600 });
+    const bNote2 = S.text({ x: 400, y: 378, text: '', size: 11, fill: K.muted });
+    const same = S.text({ x: 140, y: 472, text: '', size: 12, fill: K.accent, weight: 600, font: 'mono' });
+
+    tl.step('Kernel 1 used <code>threadIdx.x</code> as the <b>row</b>, so warp 0’s 32 threads sat in one column of the C tile. That is the picture from chapter 4.');
+    tl.show([panel, kLbl, L1, L2], 0.35);
+    tl.show([C, W, blk], 0.45, { at: '<+0.25' });
+    tl.show(dots, 0.1, { stagger: 0.02 });
+    dots.forEach((d, i) => { const [x, y] = C.center(i, 0); tl.move(d, x, y, 0.7, { at: i === 0 ? '<' : '<+0.02', arc: 22 }); });
+    tl.to(C.col(0), { fill: K.Cfill, stroke: K.C, sw: 1 }, 0.2, { at: '<+0.35', stagger: 0.02 });
+    tl.hide(dots, 0.25);
+    tl.set(asg, { text: 'warp 0  →  column 0 of the tile' });
+    tl.set(asgSub, { text: '32 rows of C, all in one column' });
+    tl.wait(1.8);
+
+    tl.step('Kernel 2 changes two lines. The row comes from <code>threadIdx.x / 32</code>, the column from <code>threadIdx.x % 32</code>. Nothing else in the kernel is touched.');
+    tl.set(kLbl, { text: 'kernel 2', fill: K.accent });
+    tl.set(L1, { text: 'const int cRow = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);' });
+    tl.set(L2, { text: 'const int cCol = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);' });
+    tl.to(panel, { stroke: K.accent }, 0.4, { at: '<' });
+    tl.set(note, { text: 'threadIdx.x now feeds the column, not the row.' }, '<+0.3');
+    tl.wait(2.2);
+
+    tl.step('The same 32 threads now own <b>row 0, columns 0 to 31</b>: thirty-two neighbors along a row of the tile.');
+    tl.show(dots, 0.1, { stagger: 0.02 });
+    dots.forEach((d, i) => { const [x, y] = C.center(0, i); tl.move(d, x, y, 0.8, { at: i === 0 ? '<' : '<+0.02', arc: -26 }); });
+    tl.to(C.col(0), { fill: K.white, stroke: '#ddd9cf', sw: 0.5 }, 0.4, { at: '<+0.4' });
+    tl.to(C.row(0), { fill: K.Cfill, stroke: K.C, sw: 1 }, 0.2, { stagger: 0.02 });
+    tl.hide(dots, 0.25);
+    tl.set(asg, { text: 'warp 0  →  row 0, columns 0 – 31' });
+    tl.set(asgSub, { text: '32 columns of C, all in one row' });
+    tl.wait(1.8);
+
+    tl.step('Same 1,024 threads, same loop, same arithmetic, same 16,384 blocks. Only <b>which thread computes which output</b> has changed.');
+    tl.set(same, { text: 'unchanged:  the k-loop  ·  the FMA  ·  1,024 threads per block  ·  16,384 blocks' });
+    tl.wait(2.2);
+
+    tl.step('So at <b>k = 0</b> the warp needs A[0][0] — one element, wanted by all 32 threads — and B[0][0 … 31]: thirty-two neighbors in one row of B.');
+    tl.set(aNote, { text: 'A:  every thread wants A[0][0]' });
+    tl.set(aNote2, { text: 'one address, thirty-two times over' });
+    tl.set(bNote, { text: 'B:  thread t wants B[0][t]' }, '<+0.6');
+    tl.set(bNote2, { text: '32 consecutive floats of row 0 of B' }, '<+0.6');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 5.2 the new byte bill
+  (function () {
+    const S = MB.scene('a-bytes2', { w: 900, h: 510, title: 'The byte bill for one warp-step of kernel 2' });
+    const tl = S.tl;
+    const cw = 13, ch = 15, x0 = 96;
+
+    const memLbl = S.text({ x: x0, y: 28, text: 'global memory, laid out row by row', size: 13, fill: K.ink, weight: 600 });
+    const secLbl = S.text({ x: x0, y: 46, text: 'one 32-byte sector = 8 consecutive floats — the smallest thing memory moves', size: 11, fill: K.muted });
+
+    const aLbl = S.text({ x: x0, y: 76, text: 'A[0][0] — the same address for all 32 threads', size: 11.5, fill: K.A, weight: 600, opacity: 0 });
+    const AT = S.tape({ x: x0, y: 92, n: 16, cell: cw, h: ch, label: 'A row 0', opacity: 0 });
+    const aSec = S.rect({ x: x0 - 2, y: 90, w: 8 * cw + 4, h: ch + 4, fill: 'none', stroke: K.grey, sw: 1.2, rx: 2, opacity: 0 });
+    const aTick = S.line({ x1: x0 + 8 * cw, y1: 89, x2: x0 + 8 * cw, y2: 92 + ch + 3, stroke: K.grey, sw: 1, opacity: 0 });
+    const aEll = S.text({ x: x0 + 16 * cw + 8, y: 92 + ch / 2, text: '… 4,092 floats', size: 9.5, fill: K.faint, opacity: 0 });
+
+    const bLbl = S.text({ x: x0, y: 184, text: 'B[0][0 … 31] — thread t wants B[0][t]', size: 11.5, fill: K.B, weight: 600, opacity: 0 });
+    const BT = S.tape({ x: x0, y: 200, n: 32, cell: cw, h: ch, label: 'B row 0', opacity: 0 });
+    const bSecs = [0, 1, 2, 3].map(i => S.rect({ x: x0 + i * 8 * cw, y: 195, w: 8 * cw, h: ch + 10, fill: 'none', stroke: '#4a4a46', sw: 1.8, rx: 2, opacity: 0 }));
+    const bTicks = [0, 1, 2, 3].map(i => S.text({ x: x0 + i * 8 * cw + 4 * cw, y: 228, text: 'sector ' + i, anchor: 'middle', size: 9.5, fill: K.muted, opacity: 0 }));
+    const bEll = S.text({ x: x0, y: 250, text: '128 consecutive bytes — four whole sectors, and every byte of them is wanted', size: 11, fill: K.muted, opacity: 0 });
+
+    const wx = 560, wy = 64;
+    const WB = S.membox({ x: wx, y: wy, w: 300, h: 172, label: 'warp 0 — 32 threads', labelPos: 'top', labelSize: 12.5, fill: '#faf9f5', stroke: K.rule, rx: 10 });
+    const TH = S.threads({ x: wx + 30, y: wy + 44, n: 32, size: 22, gap: 9, perRow: 8, fill: '#e8e5dd', stroke: '#c9c4bb' });
+
+    const cMoved = S.counter({ x: 560, y: 270, label: 'bytes moved', value: 0, size: 26, fill: K.accent, format: v => MB.fmt(v) + ' B' });
+    const cWant = S.counter({ x: 710, y: 270, label: 'bytes wanted', value: 0, size: 26, fill: K.A, format: v => MB.fmt(v) + ' B' });
+    const cSec = S.counter({ x: 860, y: 270, label: 'sectors', value: 0, size: 26, fill: K.ink, anchor: 'end' });
+
+    const aFly = S.tile({ x: x0, y: 92, rows: 1, cols: 8, cell: cw - 1, gap: 1, fill: K.dead, stroke: K.faint, on: (r, c) => c === 0, offFill: K.dead, offStroke: K.faint, frameStroke: K.grey, frameFill: '#fff', opacity: 0 });
+    aFly.cells[0].setNow({ fill: K.Afill, stroke: K.A });
+    const bFly = [0, 1, 2, 3].map(i => S.tile({ x: x0 + i * 8 * cw, y: 200, rows: 1, cols: 8, cell: cw - 1, gap: 1, fill: K.Bfill, stroke: K.B, frameStroke: K.grey, frameFill: '#fff', opacity: 0 }));
+
+    const barX = 300, barW = 500;
+    const bK1 = S.bar({ x: barX, y: 352, w: 0, h: 18, fill: K.redfill, stroke: K.red, label: 'kernel 1 — bytes moved', value: 0, format: v => MB.fmt(v) + ' B', opacity: 0 });
+    const bK2 = S.bar({ x: barX, y: 384, w: 0, h: 18, fill: K.tealfill, stroke: K.teal, label: 'kernel 2 — bytes moved', value: 0, format: v => MB.fmt(v) + ' B', opacity: 0 });
+    const bWant = S.bar({ x: barX, y: 416, w: 0, h: 18, fill: K.Afill, stroke: K.A, label: 'bytes wanted (both)', value: 0, format: v => MB.fmt(v) + ' B', opacity: 0 });
+    const eff = S.text({ x: barX, y: 458, text: '', size: 13, fill: K.ink, weight: 600 });
+    const ratio = S.text({ x: barX, y: 482, text: '', size: 13, fill: K.accent, weight: 600 });
+
+    tl.step('At <b>k = 0</b> every thread of warp 0 wants <b>A[0][0]</b> — the same address, thirty-two times. One sector comes back, 32 bytes, and the value is broadcast to all 32 threads.');
+    tl.show([aLbl, AT, aEll], 0.4);
+    tl.to(AT.cells[0], { fill: K.Afill, stroke: K.A, sw: 1.2 }, 0.3, { at: '<+0.25' });
+    tl.show([aSec, aTick], 0.3);
+    tl.show(aFly, 0.15);
+    tl.move(aFly, 658, 159.5, 0.9, { at: '<', arc: -60 });
+    tl.to(aFly, { scale: 0.25, opacity: 0 }, 0.3);
+    tl.to(TH.items, { fill: K.Afill, stroke: K.A }, 0.25, { at: '<', stagger: 0.006 });
+    tl.to(cMoved.num, { value: 32 }, 0.4, { at: '<' });
+    tl.to(cWant.num, { value: 4 }, 0.4, { at: '<' });
+    tl.to(cSec.num, { value: 1 }, 0.4, { at: '<' });
+    tl.wait(1.8);
+
+    tl.step('B is the one that changed. Thread t wants <b>B[0][t]</b>: 32 consecutive floats of row 0, which row-major storage lays out as one unbroken run of <b>128 bytes</b>.');
+    tl.show([bLbl, BT], 0.4);
+    tl.to(BT.cells, { fill: K.Bfill, stroke: K.B, sw: 1.2 }, 0.2, { at: '<+0.25', stagger: 0.02 });
+    tl.wait(1.5);
+
+    tl.step('128 divides by 32 exactly, so that run is <b>four whole sectors</b> and every byte in them is wanted. Each sector serves eight threads: four sectors, thirty-two threads.');
+    tl.show(bTicks, 0.3);
+    tl.show(bSecs, 0.3, { at: '<', stagger: 0.08 });
+    tl.show(bEll, 0.3, { at: '<' });
+    tl.wait(1.0);
+    [0, 1, 2, 3].forEach(j => {
+      tl.show(bFly[j], 0.12);
+      tl.move(bFly[j], 658, 113 + 31 * j, 0.8, { at: '<', arc: -55 });
+      tl.to(bFly[j], { scale: 0.25, opacity: 0 }, 0.26);
+      tl.to(TH.items.slice(8 * j, 8 * j + 8), { stroke: K.B, sw: 1.8 }, 0.25, { at: '<', stagger: 0.02 });
+      tl.to(cMoved.num, { value: 32 + 32 * (j + 1) }, 0.3, { at: '<' });
+      tl.to(cWant.num, { value: 4 + 32 * (j + 1) }, 0.3, { at: '<' });
+      tl.to(cSec.num, { value: 1 + (j + 1) }, 0.3, { at: '<' });
+      tl.wait(0.25);
+    });
+    tl.wait(1.4);
+
+    tl.step('The whole bill for one k-step of one warp: <b>160 bytes moved</b> to deliver the <b>132 bytes</b> the warp wanted, for the same 64 FLOPs. Kernel 1 moved 1,056 for the same 132.');
+    tl.show([bK1, bK2, bWant], 0.3);
+    bK1.grow(tl, barW, 1056, 1.0);
+    bK2.grow(tl, barW * 160 / 1056, 160, 1.0, { at: '<' });
+    bWant.grow(tl, barW * 132 / 1056, 132, 1.0, { at: '<' });
+    tl.set(eff, { text: 'useful fraction:   132 / 1,056 = 12.5%    →    132 / 160 = 82.5%' });
+    tl.wait(2.2);
+
+    tl.step('<b>1,056 ÷ 160 = 6.6.</b> If the memory system is the only thing holding this kernel back, it should now run 6.6 times faster. Chapter 4’s diagnosis has just made a prediction.');
+    tl.set(ratio, { text: '1,056 ÷ 160 = 6.6× fewer bytes moved, for exactly the same 64 FLOPs' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 5.3 predict, then measure
+  (function () {
+    const S = MB.scene('a-measure', { w: 900, h: 340, title: 'The speedup predicted from the byte bill against the measured one' });
+    const tl = S.tl;
+    const x0 = 300, W = 500;
+    const SC = W / 2100;                    // px per GFLOP/s
+    const ST = W / 768;                     // px per GB/s
+    const gf = v => (Math.round(v * 10) / 10).toLocaleString('en-US', { maximumFractionDigits: 1 });
+    const gb = v => MB.fmt(v) + ' GB/s';
+    const track = { fill: '#f6f4ee', stroke: K.rule, sw: 0.8, rx: 3 };
+
+    S.text({ x: 60, y: 28, text: 'speed on the 4,092 × 4,092 multiply, GFLOP/s', size: 12, fill: K.muted });
+    S.rect(Object.assign({ x: x0, y: 52, w: W, h: 20 }, track));
+    S.rect(Object.assign({ x: x0, y: 88, w: W, h: 20 }, track));
+    S.rect(Object.assign({ x: x0, y: 124, w: W, h: 20 }, track));
+    const b1 = S.bar({ x: x0, y: 52, w: 0, h: 20, fill: K.redfill, stroke: K.red, label: 'kernel 1 · naive', value: 0, format: gf });
+    const bp = S.bar({ x: x0, y: 88, w: 0, h: 20, fill: '#ffffff', stroke: K.accent, sw: 1.4, label: 'predicted:  309 × 6.6', value: 0, format: gf, opacity: 0 });
+    bp.rect.setNow({ dash: '6 4' });
+    const b2 = S.bar({ x: x0, y: 124, w: 0, h: 20, fill: K.tealfill, stroke: K.teal, label: 'kernel 2 · measured', value: 0, format: gf, opacity: 0 });
+
+    const h2 = S.text({ x: 60, y: 196, text: 'useful memory throughput, GB/s', size: 12, fill: K.muted, opacity: 0 });
+    const scaleNote = S.text({ x: x0 + W, y: 196, text: 'full width = 768 GB/s, what the A6000 can deliver', anchor: 'end', size: 11, fill: K.faint, opacity: 0 });
+    const tr1 = S.rect(Object.assign({ x: x0, y: 218, w: W, h: 20, opacity: 0 }, track));
+    const tr2 = S.rect(Object.assign({ x: x0, y: 254, w: W, h: 20, opacity: 0 }, track));
+    const t1 = S.bar({ x: x0, y: 218, w: 0, h: 20, fill: K.redfill, stroke: K.red, label: 'kernel 1', value: 0, format: gb, opacity: 0 });
+    const t2 = S.bar({ x: x0, y: 254, w: 0, h: 20, fill: K.tealfill, stroke: K.teal, label: 'kernel 2', value: 0, format: gb, opacity: 0 });
+    const verdict = S.text({ x: x0, y: 308, text: '', size: 13, fill: K.ink, weight: 600 });
+
+    tl.step('Kernel 1 measured <b>309 GFLOP/s</b>, which was 1.3% of cuBLAS.');
+    b1.grow(tl, 309 * SC, 309, 1.0);
+    tl.wait(1.6);
+
+    tl.step('Kernel 2 moves 6.6 times fewer bytes for identical work. If memory is all that holds the kernel back, the speed should rise by that same factor: <b>309 × 6.6 = 2,039.4</b>. That is a prediction, made before looking.');
+    tl.show(bp, 0.3);
+    bp.grow(tl, 2039.4 * SC, 2039.4, 1.4, { at: '<+0.2' });
+    tl.wait(1.8);
+
+    tl.step('Measured: <b>1,986.5 GFLOP/s</b>. A <b>6.4× speedup</b>, within 3% of a number we got by counting sectors on paper.');
+    tl.show(b2, 0.3);
+    b2.grow(tl, 1986.5 * SC, 1986.5, 1.4, { at: '<+0.2' });
+    tl.wait(2.0);
+
+    tl.step('Boehm’s profiler says the same thing from the other side: useful memory throughput rises from <b>15 GB/s to 110 GB/s</b>.');
+    tl.show([h2, scaleNote, tr1, tr2, t1, t2], 0.35);
+    t1.grow(tl, 15 * ST, 15, 0.8);
+    t2.grow(tl, 110 * ST, 110, 1.1, { at: '<+0.3' });
+    tl.wait(2.0);
+
+    tl.step('And 110 GB/s is still only <b>14% of the 768</b> the memory can deliver. The requests are the right shape now; there are still far too many of them.');
+    tl.set(verdict, { text: '6.4× measured against 6.6× predicted   ·   8.5% of cuBLAS, up from 1.3%' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 5.4 coalescing is a property of addresses
+  (function () {
+    const S = MB.scene('a-patterns', { w: 900, h: 450, title: 'Four access patterns for one warp, and the sectors each one costs' });
+    const tl = S.tl;
+    const N = 64, cw = 11, ch = 16, tx = 90, ty = 128;
+
+    S.text({ x: 90, y: 32, text: 'One warp, 32 threads, one float each. The warp always wants 128 bytes. Only the stride changes.', size: 12.5, fill: K.ink, weight: 600 });
+    const patLbl = S.text({ x: 90, y: 66, text: '', size: 14, fill: K.accent, weight: 600 });
+    S.text({ x: 90, y: 108, text: 'memory  ·  one cell = one float (4 bytes)  ·  one sector = 8 cells (32 bytes)', size: 11, fill: K.muted });
+    const T = S.tape({ x: tx, y: ty, n: N, cell: cw, h: ch });
+    const secs = [];
+    for (let i = 0; i < 8; i++) secs.push(S.rect({ x: tx + i * 8 * cw, y: ty - 3, w: 8 * cw, h: ch + 6, fill: 'none', stroke: '#cfc9bd', sw: 1.2, rx: 2 }));
+    const offNote = S.text({ x: 90, y: 168, text: '', size: 11, fill: K.muted });
+
+    const TW = S.threads({ x: 90, y: 200, n: 32, size: 11, gap: 2.5, fill: '#5b5750', label: 'the 32 threads of the warp', labelPos: 'top' });
+    const thrNote = S.text({ x: 90, y: 234, text: '', size: 11.5, fill: K.ink });
+    const cSec = S.counter({ x: 660, y: 190, label: 'sectors moved', value: 0, size: 26, anchor: 'end', fill: K.ink });
+    const cPct = S.counter({ x: 862, y: 190, label: 'of those bytes, used', value: 0, size: 26, anchor: 'end', fill: K.ink, format: v => (Math.round(v * 10) / 10) + '%' });
+
+    // ---- the summary table, filled one row per step
+    const hy = 268, col = { name: 90, sec: 520, moved: 660, used: 762, pct: 862 };
+    S.text({ x: col.name, y: hy, text: 'access pattern', size: 10.5, fill: K.muted });
+    S.text({ x: col.sec, y: hy, text: 'sectors', anchor: 'end', size: 10.5, fill: K.muted });
+    S.text({ x: col.moved, y: hy, text: 'bytes moved', anchor: 'end', size: 10.5, fill: K.muted });
+    S.text({ x: col.used, y: hy, text: 'bytes used', anchor: 'end', size: 10.5, fill: K.muted });
+    S.text({ x: col.pct, y: hy, text: 'useful', anchor: 'end', size: 10.5, fill: K.muted });
+    S.line({ x1: 90, y1: hy + 11, x2: 862, y2: hy + 11, stroke: K.rule, sw: 1 });
+
+    const PAT = [
+      { label: 'Pattern 1 — stride 1 float: 32 consecutive addresses', lit: i => i < 32, win: 4, secs: 4, moved: '128 B', pct: 100, per: 8,
+        off: '', pctFill: K.B, name: 'stride 1 float — 32 consecutive addresses' },
+      { label: 'Pattern 2 — stride 2 floats', lit: i => i % 2 === 0, win: 8, secs: 8, moved: '256 B', pct: 50, per: 4,
+        off: '', pctFill: K.ink, name: 'stride 2 floats' },
+      { label: 'Pattern 3 — stride 8 floats, which is exactly one sector', lit: i => i % 8 === 0, win: 8, secs: 32, moved: '1,024 B', pct: 12.5, per: 1,
+        off: '…  threads 8 to 31 land on 24 more sectors past the right edge, one float used in each', pctFill: K.red, name: 'stride 8 floats (32 bytes)' },
+      { label: 'Pattern 4 — stride 4,092 floats: a column of A, kernel 1’s request', lit: i => i === 0, win: 1, secs: 32, moved: '1,024 B', pct: 12.5, per: 1,
+        off: '…  the next thread’s float is 16,368 bytes further on — 31 more sectors, far off this window', pctFill: K.red, name: 'stride 4,092 floats — a column (kernel 1)' },
+    ];
+
+    const rowCells = PAT.map((p, r) => {
+      const y = 294 + r * 26;
+      return [
+        S.text({ x: col.name, y, text: p.name, size: 12, fill: K.ink, opacity: 0 }),
+        S.text({ x: col.sec, y, text: '' + p.secs, anchor: 'end', size: 12, fill: K.ink, weight: 600, opacity: 0 }),
+        S.text({ x: col.moved, y, text: p.moved, anchor: 'end', size: 12, fill: K.ink, opacity: 0 }),
+        S.text({ x: col.used, y, text: '128 B', anchor: 'end', size: 12, fill: K.A, opacity: 0 }),
+        S.text({ x: col.pct, y, text: p.pct + '%', anchor: 'end', size: 12, fill: p.pctFill, weight: 600, opacity: 0 }),
+      ];
+    });
+    const kline = S.text({ x: 90, y: 424, text: '', size: 13, fill: K.accent, weight: 600 });
+
+    const CAP = [
+      '<b>Stride 1.</b> The 32 addresses are consecutive: 128 bytes, exactly four sectors, every byte used. This is kernel 2’s request for B.',
+      '<b>Stride 2.</b> The same 32 floats, now spread over 256 bytes. Eight sectors move, and half of every one of them is thrown away.',
+      '<b>Stride 8 floats — 32 bytes.</b> Each wanted float now sits alone in its own sector. Thirty-two sectors, 1,024 bytes, 12.5% used.',
+      '<b>Stride 4,092 floats — a column of A.</b> Kernel 1’s pattern. The same 32 sectors, the same 1,024 bytes, the same 12.5%: past one sector of stride, it stops getting worse.',
+    ];
+
+    PAT.forEach((p, r) => {
+      tl.step(CAP[r]);
+      // reset the tape and the sector frames
+      tl.to(T.cells, { fill: K.white, stroke: '#c9c4bb', sw: 0.7 }, 0.25);
+      tl.to(secs, { stroke: '#cfc9bd', sw: 1.2 }, 0.25, { at: '<' });
+      tl.set(patLbl, { text: p.label }, '<');
+      tl.set(offNote, { text: p.off }, '<');
+      tl.set(thrNote, { text: 'each arriving sector serves ' + p.per + (p.per === 1 ? ' thread' : ' threads') + ' of the 32' }, '<');
+      // the sectors that have to move (the pale red cells inside them carry the waste)
+      tl.to(secs.slice(0, p.win), { stroke: '#4a4a46', sw: 1.8 }, 0.3, { stagger: 0.04 });
+      const want = [], waste = [];
+      for (let i = 0; i < N; i++) {
+        if (i < p.win * 8) { if (p.lit(i)) want.push(T.cells[i]); else waste.push(T.cells[i]); }
+      }
+      tl.to(waste, { fill: K.redfill, stroke: '#e3b7b7' }, 0.25, { at: '<+0.1', stagger: 0.004 });
+      tl.to(want, { fill: K.Afill, stroke: K.A, sw: 1.1 }, 0.25, { at: '<+0.2', stagger: 0.006 });
+      // thread squares shaded in alternating groups, one group per arriving sector
+      const even = TW.items.filter((it, i) => Math.floor(i / p.per) % 2 === 0);
+      const odd = TW.items.filter((it, i) => Math.floor(i / p.per) % 2 === 1);
+      tl.to(even, { fill: '#5b5750' }, 0.3, { at: '<+0.2' });
+      tl.to(odd, { fill: '#b6b1a8' }, 0.3, { at: '<' });
+      tl.to(cSec.num, { value: p.secs }, 0.5);
+      tl.to(cPct.num, { value: p.pct }, 0.5, { at: '<' });
+      tl.to(cSec.num, { fill: p.secs > 8 ? K.red : K.ink }, 0.3, { at: '<' });
+      tl.to(cPct.num, { fill: p.pctFill }, 0.3, { at: '<' });
+      tl.show(rowCells[r], 0.35, { at: '<' });
+      tl.wait(2.0);
+    });
+
+    tl.step('The hardware did the same thing every time: fetch whole sectors, as many as it takes. Only the addresses changed. <b>Coalescing is not something the GPU does; it is a property your access pattern has or lacks.</b>');
+    tl.set(kline, { text: 'same hardware, same rule — whole sectors only.  The addresses did all of the work.' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 5.5 why not 768 GB/s yet
+  (function () {
+    const S = MB.scene('a-rereads', { w: 900, h: 440, title: 'Every block re-reads the same strips of A and B, so the number of requests is unchanged' });
+    const tl = S.tl, mc = 22;
+    const base = { fill: '#f7f6f2', stroke: '#ddd9cf', sw: 0.6 };
+
+    S.text({ x: 60, y: 32, text: 'A block computes one 32 × 32 tile of C. To do it, it reads a whole row strip of A and a whole column strip of B.', size: 12.5, fill: K.ink, weight: 600 });
+    S.text({ x: 60, y: 54, text: 'The drawing is 8 × 8. The real problem has 128 tiles along each edge — 16,384 blocks.', size: 11, fill: K.muted });
+
+    const A = S.matrix(Object.assign({ x: 60, y: 110, rows: 8, cols: 8, cell: mc, label: 'A', labelSize: 15 }, base));
+    const B = S.matrix(Object.assign({ x: 296, y: 110, rows: 8, cols: 8, cell: mc, label: 'B', labelSize: 15 }, base));
+    const Cm = S.matrix(Object.assign({ x: 600, y: 110, rows: 8, cols: 8, cell: mc, label: 'C', labelSize: 15 }, base));
+    S.text({ x: 266, y: 198, text: '×', anchor: 'middle', size: 20, fill: K.muted });
+    S.text({ x: 536, y: 198, text: '=', anchor: 'middle', size: 20, fill: K.muted });
+    S.text({ x: 148, y: 306, text: 'one row = one 32 × 4,092 strip', anchor: 'middle', size: 11, fill: K.muted });
+    S.text({ x: 384, y: 306, text: 'one column = one 4,092 × 32 strip', anchor: 'middle', size: 11, fill: K.muted });
+    S.text({ x: 688, y: 306, text: 'one cell = one 32 × 32 tile (a block)', anchor: 'middle', size: 11, fill: K.muted });
+
+    const cnt = S.counter({ x: 60, y: 340, label: 'times row strip 0 of A is fetched', value: 0, size: 30, fill: K.red });
+    const l1 = S.text({ x: 380, y: 340, text: '', size: 12.5, fill: K.ink });
+    const l2 = S.text({ x: 380, y: 364, text: '', size: 12.5, fill: K.ink });
+    const fin = S.text({ x: 60, y: 414, text: '', size: 13.5, fill: K.accent, weight: 600 });
+
+    const lit = { fill: K.Cfill, stroke: K.C, sw: 1 };
+
+    tl.step('Block (0, 0) computes the top-left tile of C. For that it reads <b>all of row strip 0 of A</b> and all of column strip 0 of B.');
+    tl.to(Cm.cellAt(0, 0), lit, 0.4);
+    tl.to(A.row(0), { fill: K.Afill, stroke: K.A, sw: 1 }, 0.25, { at: '<', stagger: 0.05 });
+    tl.to(B.col(0), { fill: K.Bfill, stroke: K.B, sw: 1 }, 0.25, { at: '<', stagger: 0.05 });
+    tl.to(cnt.num, { value: 1 }, 0.4);
+    tl.wait(1.8);
+
+    tl.step('Block (0, 1) is the tile next door. A different column strip of B — and <b>exactly the same row strip of A</b>, fetched a second time.');
+    tl.to(B.col(0), Object.assign({}, base), 0.3);
+    tl.to(B.col(1), { fill: K.Bfill, stroke: K.B, sw: 1 }, 0.3, { at: '<' });
+    tl.to(Cm.cellAt(0, 1), lit, 0.3, { at: '<' });
+    tl.to(A.row(0), { fill: '#a9c6f5' }, 0.2, { at: '<' });
+    tl.to(A.row(0), { fill: K.Afill }, 0.25);
+    tl.to(cnt.num, { value: 2 }, 0.25, { at: '<' });
+    tl.wait(1.8);
+
+    tl.step('Keep walking along the row of tiles. In the real problem there are <b>128 tiles across</b>, so row strip 0 of A is fetched 128 times — and every other strip of A, and every column strip of B, gets the same treatment.');
+    for (let c = 2; c < 8; c++) {
+      tl.to(B.col(c - 1), Object.assign({}, base), 0.12);
+      tl.to(B.col(c), { fill: K.Bfill, stroke: K.B, sw: 1 }, 0.12, { at: '<' });
+      tl.to(Cm.cellAt(0, c), lit, 0.12, { at: '<' });
+      tl.to(A.row(0), { fill: '#a9c6f5' }, 0.1, { at: '<' });
+      tl.to(A.row(0), { fill: K.Afill }, 0.15);
+      tl.to(cnt.num, { value: c + 1 }, 0.15, { at: '<' });
+    }
+    tl.wait(0.5);
+    tl.to(cnt.num, { value: 128 }, 1.3);
+    tl.wait(2.0);
+
+    tl.step('And that is only the waste <b>between</b> blocks. Inside one block, every value of A is read 32 more times — chapter 6’s subject. Kernel 2 issues exactly the loads kernel 1 issued.');
+    const rest = [];
+    for (let r = 1; r < 8; r++) for (let c = 0; c < 8; c++) rest.push(Cm.cellAt(r, c));
+    tl.to(rest, { fill: K.Cfill, stroke: K.C, sw: 0.8 }, 0.08, { stagger: 0.012 });
+    tl.to(A.all(), { fill: K.Afill, stroke: K.A, sw: 0.7 }, 0.4, { at: '<+0.3' });
+    tl.to(B.all(), { fill: K.Bfill, stroke: K.B, sw: 0.7 }, 0.4, { at: '<' });
+    tl.set(l1, { text: '…and inside each block, every value is fetched 32 more times  ·  chapter 6' });
+    tl.set(l2, { text: 'total: 137 billion loads, 548 GB requested — exactly kernel 1’s number' }, '<+0.4');
+    tl.wait(2.6);
+
+    tl.step('Coalescing fixed the <b>shape</b> of each request. It did nothing about the <b>number</b> of requests. That is what the next kernels attack.');
+    tl.set(fin, { text: 'coalescing fixed the shape of each request, not the number of them' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

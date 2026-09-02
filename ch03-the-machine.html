@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The machine a kernel sees: threads, warps, and three memories · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 3 · <em>Foundations</em></div>
+<h1>The machine a kernel sees: threads, warps, and three memories</h1>
+<p class="lede">The ten kernels are written in a vocabulary that assumes you already know what a warp is and which of three memories you meant. Here is that vocabulary, as mechanism rather than definitions.</p>
+<div class="byline">Hardware · <em>NVIDIA A6000, Ampere</em> · 84 SMs · 10,752 lanes · three memories</div>
+
+<p>So far everything has been arithmetic on paper. Chapter 1 counted the work, 137 GFLOP, and divided it by what the card can do to get a floor of 4.6 milliseconds. Chapter 2 put the memory clock next to the arithmetic clock and found that this multiply ought to be compute-bound with room to spare. Neither chapter needed to know anything about the chip beyond two numbers.</p>
+
+<p>That ends here. From the next chapter on we're reading code that runs on a particular piece of silicon, and the code leans on a handful of hardware facts that it never states. I'd rather introduce those facts as mechanisms than as definitions, because the definitions are short and mostly useless on their own. Knowing that a warp is 32 threads tells you nothing. Watching what a warp does to a load instruction tells you why kernel 1 gets 1.3% of the machine and why kernel 2, which changes two lines, gets six times more — and those turn out to be the same fact seen twice.</p>
+
+<p>There's no CUDA code in this chapter. Chapter 4 has the first kernel, nine lines of it, and everything below is something those nine lines quietly rely on.</p>
+
+<h2><span class="no">3.1</span>Threads, blocks, and the grid</h2>
+
+<p>When you launch a CUDA kernel you don't launch a thread. You launch a <em>grid</em> of <em>blocks</em>, and the hardware makes the threads. A block holds up to 1,024 of them. All 1,024 run on one streaming multiprocessor — one SM — and they share that SM's shared memory, which is the one place in this machine where threads can hand each other data cheaply.</p>
+
+<p>Blocks, on the other hand, are strangers to each other. A block can't wait for another block, can't read another block's shared memory, and can't assume anything about when another block runs or whether it has run at all. The hardware hands blocks out to SMs as slots free up, in whatever order suits it, and when a block finishes, its slot takes the next one from the queue. That independence is why the same compiled kernel runs on a small GPU and a large one without anybody recompiling anything: with fewer SMs, the blocks simply queue for longer.</p>
+
+<p>For our problem the shape works out like this. C is 4,092 × 4,092. Give each block a 32 × 32 tile of it — 1,024 threads, one per output element, which is the largest block the hardware allows. Then 4,092 ÷ 32 = 127.9, so we need 128 blocks across and 128 down. That's 16,384 blocks, and the last row and column of them hang over the edge of C, because 4,092 isn't a multiple of 32. One thread per element of C works out at about 16.7 million threads in all.</p>
+
+<figure class="wide">
+  <div id="a-grid"></div>
+  <figcaption><b>Figure 3.1.</b> A launch is a grid of blocks; blocks land on SMs as slots free up. Then one SM opened up: the block that landed there, its 32 warps, and the four schedulers that will issue their instructions.</figcaption>
+</figure>
+
+<p>Eighty-four SMs and 16,384 blocks means each SM will work through roughly two hundred of them, one or a few at a time. Nothing in the kernel says which block goes where, and nothing may depend on it.</p>
+
+<h2><span class="no">3.2</span>The SM, and the warp as the unit of execution</h2>
+
+<p>An SM is the unit that actually runs anything, so let's open one up. Inside you'll find 128 FP32 lanes — the pieces that do the fused multiply-adds we counted in chapter 1 — a register file of 65,536 32-bit registers, up to 100 KB of shared memory with an L1 data cache sitting alongside it, and four <em>warp schedulers</em>.</p>
+
+<p>The schedulers are the part to slow down on. Each one issues one instruction per clock, for one warp, to its own 32 lanes. Four schedulers, 32 lanes each, is where the 128 comes from. And notice what that arrangement rules out: the machine never issues an instruction for <em>a</em> thread. The smallest thing it can issue an instruction for is 32 threads at once.</p>
+
+<p>Those 32 are a <em>warp</em>. A warp is 32 consecutive threads of a block — threads 0 to 31, then 32 to 63, and so on — so a block of 1,024 threads is exactly 32 warps. When a scheduler picks a warp and issues an FMA, all 32 lanes perform that FMA in the same cycle, each on its own registers, each producing its own result. NVIDIA's name for this is SIMT: single instruction, multiple threads.</p>
+
+<figure class="wide">
+  <div id="a-warp"></div>
+  <figcaption><b>Figure 3.2.</b> One warp, three instructions. The scheduler issues each one once; 32 lanes carry it out on 32 different pairs of numbers. The <code>a</code> and <code>b</code> values are drawn from a seeded generator and the products are computed, so the arithmetic on screen is real.</figcaption>
+</figure>
+
+<p>Now apply that to a load, which is where this stops being trivia. A warp reaching <code>A[x * K + k]</code> does not issue one address. Thread 0 works out its address, thread 1 works out its own, all 32 do, and the 32 addresses go out together as a single request to the memory system. Whether that request is cheap or ruinous depends entirely on how those 32 addresses sit relative to one another, which is section 3.5 and most of chapters 4 and 5.</p>
+
+<p>Which gives us the habit to build before any code: stop asking what a thread does, and start asking what its warp asks for. A thread's cost is an accounting fiction. The warp is what the hardware charges for.</p>
+
+<div class="aside">
+  <div class="t">Aside · what a stalled warp costs</div>
+  <p>An SM can hold at most 1,536 threads at once, which is 48 warps. Warps that are loaded onto it are called <em>resident</em>. When a resident warp stalls waiting for a load to come back, its scheduler doesn't wait with it — it switches to another resident warp that's ready, in the same cycle, at no cost. That's latency hiding, and it's the entire reason the number of resident warps is a thing anybody talks about. Chapter 10 makes a whole chapter of it, and shows that more resident warps is not automatically better.</p>
+</div>
+
+<h2><span class="no">3.3</span>Three memories, three distances</h2>
+
+<p>A kernel can put a number in three places, and choosing between them is most of what the ten kernels are doing.</p>
+
+<p><b>Registers</b> are private to one thread. They're the fastest storage on the chip, and a value in a register is available in the same cycle the instruction uses it, so for our purposes a register read is free. You don't allocate them; the compiler does, out of the SM's 65,536 registers, and no thread may have more than 255. That register file is shared by every resident thread on the SM, which is why a kernel that wants a lot of registers per thread ends up with fewer threads resident. Chapter 9's kernel spends 64 registers per thread on accumulators alone and is faster for it.</p>
+
+<p><b>Shared memory</b> is a scratchpad on the SM, visible to every thread in the block and to nobody else. The program fills it explicitly — a kernel copies values there from global memory — and what it puts there stays until something overwrites it. A block may use 48 KB of the SM's 100 KB. Reading it takes roughly 20 to 30 cycles. That's the whole idea behind kernel 3: fetch a tile of A and B once into shared memory, then let all 1,024 threads read it from there instead of each going to DRAM for its own copy.</p>
+
+<p><b>Global memory</b> is the DRAM: 48 GB of GDDR6, 768 GB/s, visible to everything, and hundreds of cycles away. A, B and C live here, because nothing else is big enough. Every byte the kernel works on starts here and every byte of the answer ends here; the only question is how many times it makes the trip.</p>
+
+<p>There are caches in between — 6 MB of L2 shared by all 84 SMs, and the L1 on each SM — and they hold whatever was recently touched. They help, sometimes a lot. But you can't tell them what to keep: shared memory is a cache you control, and L1 and L2 are caches that happen to you.</p>
+
+<figure class="wide">
+  <div id="a-memories"></div>
+  <figcaption><b>Figure 3.3.</b> One thread issues three loads at cycle 0, one to each level. The register value is already there; shared memory answers in tens of cycles; the DRAM takes hundreds. The clock runs 20× faster after cycle 25, or you'd be watching an empty screen.</figcaption>
+</figure>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Registers</div><div class="v">256<small>KB / SM</small></div><div class="d">65,536 of them · at most 255 per thread</div></div>
+  <div class="cell"><div class="l">Shared memory</div><div class="v">48<small>KB / block</small></div><div class="d">up to 100 KB per SM · loaded by the program</div></div>
+  <div class="cell"><div class="l">L2 cache</div><div class="v">6<small>MB</small></div><div class="d">shared by all 84 SMs · not under your control</div></div>
+  <div class="cell"><div class="l">Global memory</div><div class="v">48<small>GB</small></div><div class="d">GDDR6 at 768 GB/s · 400–600 cycles away</div></div>
+</div>
+
+<p>Put the latencies next to the arithmetic and the shape of the problem appears. One lane retires one FMA per clock. So four to six hundred cycles of waiting is four to six hundred multiply-adds that lane didn't do — and a kernel that goes to global memory for every operand of every FMA is idle almost all of the time, no matter how many warps you give it to switch between.</p>
+
+<p>There are only two things to do about that: fetch fewer bytes, and fetch the bytes you do need into the near memories, where they can be read again for nothing. Kernel 2 does the first, by asking for its bytes in a better order. Kernel 3 does the second with shared memory, kernels 4 and 5 do it with registers, and kernel 10 adds a level in between.</p>
+
+<h2><span class="no">3.4</span>How a matrix sits in memory</h2>
+
+<p>One more piece before the sectors, and it's a dull one. Memory is one line of bytes. It has one dimension, and a matrix has two, so somebody has to decide how to flatten it.</p>
+
+<p>C and CUDA use <em>row-major</em> order: all of row 0, then all of row 1, then row 2, laid out end to end. For a matrix with K columns, the element A[i][k] therefore lives at</p>
+
+<pre><code>base + (i * K + k) * <span class="n">4</span>        <span class="c">// 4 = sizeof(float)</span></code></pre>
+
+<p>bytes from the start. Which is why <code>A[x * K + k]</code> appeared in the kernel-1 code as a flat, one-dimensional index: that's what the hardware sees anyway, and CUDA doesn't pretend otherwise.</p>
+
+<figure class="wide">
+  <div id="a-rowmajor"></div>
+  <figcaption><b>Figure 3.4.</b> A 4 × 6 matrix flattened row by row onto a tape of 24 floats. A[2][3] lands at position 2 × 6 + 3 = 15, which is byte 60. The values are from a seeded integer matrix, so the addresses are arithmetic you can check.</figcaption>
+</figure>
+
+<p>Two consequences fall out of that. Two neighbors in the same <b>row</b> are adjacent on the tape: 4 bytes apart. Two neighbors in the same <b>column</b> are a whole row apart: K × 4 bytes. For our matrices, with K = 4,092, that's 16,368 bytes between one element and the one directly below it.</p>
+
+<p>Walking along a row and walking down a column look equally natural when you write the loop. They are not remotely the same thing to the memory system, and the next section says by how much.</p>
+
+<h2><span class="no">3.5</span>Sectors and lines</h2>
+
+<p>The memory system does not deliver floats. The smallest thing it will move is a 32-byte <em>sector</em>: eight consecutive floats, aligned. Ask for one of them and all eight come back, whether or not you wanted the other seven. Above the sector there's the cache line, 128 bytes, which is four sectors.</p>
+
+<p>This isn't a quirk to be worked around. It's how DRAM and the caches are built — moving eight floats costs barely more than moving one, so the hardware always moves eight — and it turns a warp's 32 addresses into a bill.</p>
+
+<figure class="wide">
+  <div id="a-sectors"></div>
+  <figcaption><b>Figure 3.5.</b> The same 32 floats, requested two ways. Consecutive: four sectors, 128 bytes, nothing wasted. One per row, 16,368 bytes apart: 32 separate sectors, 1,024 bytes, and one byte in eight was wanted.</figcaption>
+</figure>
+
+<p>Take a warp whose 32 threads want 32 <b>consecutive</b> floats. Those 128 bytes sit in four sectors, the memory system fetches four sectors, and every byte it moved gets used. Now take a warp whose 32 threads want one float from each of 32 different rows — the column walk from the last section, 16,368 bytes between neighbors. No two of those floats share a sector, so the memory system fetches 32 sectors: 1,024 bytes moved to deliver the 128 that were asked for. One byte in eight, or 12.5%.</p>
+
+<p>Same 32 floats. Same instruction. Eight times the traffic, purely because of which 32 addresses went out together.</p>
+
+<div class="key">
+  <div class="t">What to carry into chapter 4</div>
+  <p>Two remedies, one habit. The remedies: <b>fetch less</b>, and <b>fetch into the near memories</b> — registers and shared memory — where a value can be read again for nothing. The habit: <b>think in warps, not threads</b>. A single thread's loads have no cost you can reason about; a warp's 32 addresses do.</p>
+</div>
+
+<p>That's the machine. Grid, block, warp, lane; register, shared memory, global memory; row-major, sector, line. Nothing here is subtle, and none of it is specific to matrix multiplication — it's the same machine whatever you write for it.</p>
+
+<p>Chapter 4 writes the obvious kernel, one thread per output element, and finds it running at 1.3% of cuBLAS. Every piece of the explanation is on this page already. Its warps ask for columns.</p>
+
+<p>If you'd like a longer, slower version of this chapter before going on, the companion post <a href="https://vizuaraai.github.io/cuda-programming-model/">The CUDA Programming Model</a> follows a single dog photograph through an H100 — same hierarchy, different chip, and a lot more room to look around in.</p>
+
+<div class="pager"></div>
+<div class="colophon">The hardware figures — 84 SMs, 128 FP32 lanes, four warp schedulers, 65,536 registers, 100 KB of shared memory, 1,536 resident threads, 6 MB of L2, 48 GB at 768 GB/s — are from the RTX A6000 datasheet and the CUDA C++ Programming Guide. The latency ranges are orders of magnitude, not measurements on this card. The mechanism in figures 3.1 to 3.3 follows Stephen Jones' GTC 2022 talk <em>How CUDA Programming Works</em>, which covers the same ground at greater length. The matrix in figure 3.4 is a seeded integer matrix and the sector counts in figure 3.5 are arithmetic on 32-byte sectors, not typed-in numbers.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 3.1 grid → SMs → one SM
+  (function () {
+    const S = MB.scene('a-grid', { w: 900, h: 580, title: 'A grid of 16,384 blocks dispatched to 84 SMs' });
+    const tl = S.tl;
+
+    // --- left: C cut into blocks (16 x 16 stands for 128 x 128)
+    const CB = S.matrix({ x: 60, y: 96, rows: 16, cols: 16, cell: 11, stroke: '#e0d9cf', sw: 0.6,
+      label: 'C, cut into 32 × 32 tiles', labelSize: 12 });        // 60..236, 96..272
+    const cn1 = S.text({ x: 60, y: 296, text: '4,092 ÷ 32 = 127.9, rounded up: 128 blocks each way', size: 11, fill: K.muted, opacity: 0 });
+    const cn2 = S.text({ x: 60, y: 314, text: '128 × 128 = 16,384 blocks · 1,024 threads each', size: 11, fill: K.ink, weight: 600, opacity: 0 });
+    const oneB = S.rect({ x: 60 + 5 * 11 - 2, y: 96 + 6 * 11 - 2, w: 15, h: 15, fill: 'none', stroke: K.C, sw: 1.8, rx: 2, opacity: 0 });
+
+    // --- right: 84 SMs
+    const SMs = S.threads({ x: 440, y: 96, n: 84, size: 20, gap: 7, perRow: 12, fill: '#eceae3', stroke: '#d5d1c7',
+      label: 'the A6000 — 84 SMs', labelPos: 'top', labelSize: 12, labelFill: K.ink });   // 440..757, 96..278
+    const cRun = S.counter({ x: 440, y: 296, label: 'blocks running right now', value: 0, size: 21 });
+    const cQ = S.counter({ x: 640, y: 296, label: 'blocks still queued', value: 16384, size: 21 });
+
+    // --- flying blocks
+    const src = [[1, 2], [3, 7], [5, 1], [6, 11], [8, 4], [10, 9], [12, 2], [13, 13], [2, 14], [7, 6], [9, 0], [14, 8], [4, 10], [11, 5]];
+    const dst = [3, 17, 28, 41, 55, 66, 78, 9, 22, 36, 49, 61, 73, 7];
+    const fly = src.map(p => {
+      const [cx, cy] = CB.center(p[0], p[1]);
+      return S.tile({ x: cx - 5, y: cy - 5, rows: 1, cols: 1, cell: 10, fill: K.Cfill, stroke: K.C, sw: 1.1, opacity: 0 });
+    });
+
+    // --- bottom: one SM opened up
+    const BOX = S.membox({ x: 40, y: 346, w: 820, h: 218, label: 'one SM, with one block resident on it',
+      labelPos: 'topleft', labelSize: 12.5, fill: '#fbfaf7', stroke: K.rule, rx: 12, opacity: 0 });
+    const link = S.path({ d: 'M602,282 C602,318 500,314 452,342', stroke: K.C, sw: 1.3, arrow: true, opacity: 0 });
+    const thLbl = S.text({ x: 64, y: 374, text: '1,024 threads · 32 rows of 32 · one row = one warp', size: 10.5, fill: K.muted, opacity: 0 });
+    const TH = S.threads({ x: 64, y: 386, n: 1024, size: 4.2, gap: 1.2, perRow: 32, fill: '#d9d5cb', stroke: 'none', opacity: 0 });
+
+    const sch = [];
+    for (let i = 0; i < 4; i++) {
+      const g = S.group({ tx: 270 + i * 146, ty: 382, opacity: 0 });
+      g.rect({ x: 0, y: 0, w: 138, h: 58, fill: '#fff', stroke: K.rule, sw: 1, rx: 7 });
+      g.text({ x: 69, y: 14, text: 'warp scheduler ' + i, anchor: 'middle', size: 10.5, fill: K.muted });
+      const t = S._threads(g.node, { x: 22, y: 25, n: 32, size: 4.5, gap: 1.5, perRow: 16, fill: '#d9d5cb' });
+      g.text({ x: 69, y: 48, text: '32 lanes', anchor: 'middle', size: 9, fill: K.faint });
+      sch.push({ g, t });
+    }
+    const sn1 = S.text({ x: 270, y: 458, text: '4 schedulers × 32 lanes = 128 FP32 lanes on this SM', size: 11.5, fill: K.ink, weight: 600, opacity: 0 });
+    const sn2 = S.text({ x: 270, y: 476, text: 'each clock, each scheduler issues one instruction for one warp', size: 11, fill: K.muted, opacity: 0 });
+    const sn3 = S.text({ x: 270, y: 500, text: '65,536 registers (256 KB) · up to 100 KB of shared memory · L1 alongside it', size: 11, fill: K.muted, opacity: 0 });
+    const slots = S.threads({ x: 270, y: 522, n: 48, size: 8, gap: 3, perRow: 24, fill: '#efece5', stroke: '#ddd9d0', opacity: 0 });
+    const slotLbl = S.text({ x: 543, y: 532, text: '48 warp slots on this SM (1,536 threads)', size: 11, fill: K.ink, weight: 600, opacity: 0 });
+
+    tl.step('A kernel launch is a <b>grid of blocks</b>. Each block here owns one 32 × 32 tile of C, which is <b>1,024 threads</b>, one per output element.');
+    tl.show(oneB, 0.4);
+    tl.to(CB.cellAt(6, 5), { fill: K.Cfill, stroke: K.C, sw: 1.2 }, 0.4, { at: '<' });
+    tl.show([cn1, cn2], 0.4, { at: '<+0.3' });
+    tl.wait(2.0);
+
+    tl.step('The hardware hands blocks to SMs as slots free up, in whatever order it likes. <b>Blocks never talk to each other</b> — that is why the same kernel runs on any number of SMs.');
+    tl.hide(oneB, 0.3);
+    fly.forEach((f, i) => {
+      const [sx, sy] = SMs.center(dst[i]);
+      const at = i === 0 ? undefined : '<+0.09';
+      tl.show(f, 0.12, { at });
+      tl.to(CB.cellAt(src[i][0], src[i][1]), { fill: K.Cfill, stroke: K.C }, 0.12, { at: '<' });
+      tl.move(f, sx - 5, sy - 5, 0.85, { at: '<', arc: -55 });
+      tl.to(f, { opacity: 0, scale: 0.3 }, 0.2);
+      tl.to(SMs.items[dst[i]], { fill: K.Cfill, stroke: K.C }, 0.25, { at: '<' });
+    });
+    tl.to(cRun.num, { value: 84 }, 1.6, { at: '<-1.4', ease: 'linear' });
+    tl.to(cQ.num, { value: 16300 }, 1.6, { at: '<', ease: 'linear' });
+    tl.to(SMs.items, { fill: K.Cfill, stroke: K.C }, 0.2, { stagger: 0.006 });
+    tl.wait(1.6);
+
+    tl.step('Open one SM up. The block that landed on it is 1,024 threads, and the hardware groups them into <b>32 warps</b> of 32 — one row of the grid below is one warp.');
+    tl.show(BOX, 0.4);
+    tl.show(link, 0.3, { at: '<' });
+    tl.show([TH, thLbl], 0.5, { at: '<+0.2' });
+    tl.wait(2.0);
+
+    tl.step('An SM has <b>four warp schedulers</b>. Each clock, each one picks a warp and issues a single instruction to its own 32 lanes. Four times 32 is the SM’s 128 FP32 lanes.');
+    tl.show(sch, 0.35, { stagger: 0.12 });
+    tl.show([sn1, sn2, sn3], 0.4);
+    for (let c = 0; c < 5; c++) {
+      sch.forEach((s, i) => {
+        const w = (c * 4 + i) % 32;
+        tl.to(s.t.items, { fill: K.teal }, 0.12, { at: c === 0 && i === 0 ? undefined : '<' });
+        tl.to(TH.items.slice(w * 32, w * 32 + 32), { fill: K.teal }, 0.12, { at: '<' });
+      });
+      tl.wait(c === 4 ? 2.4 : 0.34);
+      if (c === 4) break;
+      sch.forEach((s, i) => {
+        const w = (c * 4 + i) % 32;
+        tl.to(s.t.items, { fill: '#d9d5cb' }, 0.12, { at: i === 0 ? undefined : '<' });
+        tl.to(TH.items.slice(w * 32, w * 32 + 32), { fill: '#d9d5cb' }, 0.12, { at: '<' });
+      });
+      tl.wait(0.14);
+    }
+
+    tl.step('An SM holds at most <b>1,536 threads — 48 warps</b> — at once. Those are the warps a scheduler can switch to when the one it is running stalls on a load, which is the only way this machine hides latency.');
+    tl.show([slots, slotLbl], 0.4);
+    tl.to(slots.items.slice(0, 32), { fill: K.tealfill, stroke: K.teal }, 0.15, { stagger: 0.015 });
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 3.2 one instruction, 32 lanes
+  (function () {
+    const S = MB.scene('a-warp', { w: 900, h: 420, title: 'One instruction, 32 lanes' });
+    const tl = S.tl;
+    const rnd = MB.rng(3), av = [], bv = [], pv = [];
+    for (let i = 0; i < 32; i++) { av.push(1 + Math.floor(rnd() * 9)); bv.push(1 + Math.floor(rnd() * 9)); }
+    for (let i = 0; i < 32; i++) pv.push(av[i] * bv[i]);
+
+    S.text({ x: 40, y: 28, text: 'warp 0 — threads 0 … 31 of one block', size: 13, fill: K.ink, weight: 600 });
+    S.membox({ x: 40, y: 44, w: 340, h: 34, label: 'one warp scheduler · 1 instruction per clock', labelPos: 'center', labelSize: 11.5, fill: K.greyfill, stroke: K.grey, rx: 8 });
+
+    const names = ['LDG    a', 'LDG    b', 'FFMA   tmp = a × b + tmp', '…      then the next k'];
+    const tags = ['load from global memory', 'load from global memory', 'multiply and add', ''];
+    const rows = [];
+    for (let i = 0; i < 4; i++) {
+      const g = S.group({ tx: 40, ty: 100 + i * 26, opacity: 0 });
+      g.rect({ x: 0, y: -10, w: 340, h: 22, fill: i === 2 ? K.tealfill : '#fff', stroke: i === 2 ? K.teal : K.rule, sw: 1, rx: 4 });
+      g.text({ x: 10, y: 0.5, text: names[i], font: 'mono', size: 11.5, fill: i === 2 ? K.teal : K.ink, weight: i === 2 ? 600 : 400 });
+      g.text({ x: 330, y: 0.5, text: tags[i], anchor: 'end', size: 9, fill: K.faint });
+      rows.push(g);
+    }
+    const ptr = S.text({ x: 28, y: 100, text: '▶', size: 11, fill: K.accent, opacity: 0 });
+
+    const cIns = S.counter({ x: 420, y: 52, label: 'instructions issued', value: 0, size: 21 });
+    const cAdr = S.counter({ x: 620, y: 52, label: 'addresses issued', value: 0, size: 21 });
+    const cRes = S.counter({ x: 855, y: 52, label: 'results produced', value: 0, size: 21, anchor: 'end' });
+    const nt1 = S.text({ x: 420, y: 110, text: 'SIMT — single instruction, multiple threads.', size: 12, fill: K.ink, weight: 600, opacity: 0 });
+    const nt2 = S.text({ x: 420, y: 130, text: 'The scheduler issues once. All 32 lanes carry it out', size: 11.5, fill: K.muted, opacity: 0 });
+    const nt3 = S.text({ x: 420, y: 147, text: 'in the same cycle, each on its own data.', size: 11.5, fill: K.muted, opacity: 0 });
+    const nt4 = S.text({ x: 420, y: 172, text: '', size: 11.5, fill: K.accent, weight: 600 });
+
+    S.text({ x: 110, y: 222, text: '32 lanes — one per thread of the warp', size: 12, fill: K.ink, weight: 600 });
+    S.text({ x: 120, y: 240, text: 'lane 0', anchor: 'middle', size: 9, fill: K.faint });
+    S.text({ x: 845, y: 240, text: 'lane 31', anchor: 'middle', size: 9, fill: K.faint });
+    const LN = S.threads({ x: 110, y: 250, n: 32, size: 20, gap: 3.4, fill: '#e7e4dc', stroke: '#cfcabf' });
+
+    S.text({ x: 100, y: 290, text: 'a', anchor: 'end', size: 11, fill: K.A, weight: 600 });
+    S.text({ x: 100, y: 308, text: 'b', anchor: 'end', size: 11, fill: K.B, weight: 600 });
+    S.text({ x: 100, y: 330, text: 'a × b', anchor: 'end', size: 11, fill: K.teal, weight: 600 });
+    const aT = [], bT = [], pT = [];
+    for (let i = 0; i < 32; i++) {
+      const cx = 120 + i * 23.4;
+      aT.push(S.text({ x: cx, y: 290, text: '' + av[i], anchor: 'middle', size: 10, fill: K.Adeep, opacity: 0 }));
+      bT.push(S.text({ x: cx, y: 308, text: '' + bv[i], anchor: 'middle', size: 10, fill: K.Bdeep, opacity: 0 }));
+      pT.push(S.text({ x: cx, y: 330, text: '' + pv[i], anchor: 'middle', size: 11, fill: K.teal, weight: 600, opacity: 0 }));
+    }
+    const sum1 = S.text({ x: 110, y: 370, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const sum2 = S.text({ x: 110, y: 392, text: '', size: 11.5, fill: K.muted });
+
+    tl.step('A warp is <b>32 threads that move together</b>. The scheduler issues one instruction; all 32 lanes run it, each on its own data.');
+    tl.show(rows, 0.3, { stagger: 0.1 });
+    tl.show([nt1, nt2, nt3], 0.4);
+    tl.wait(2.8);
+
+    tl.step('<b>LDG a.</b> One instruction — and 32 different values of <code>a</code> arrive, one per lane. The warp put 32 addresses on the memory system in a single request.');
+    tl.set(ptr, { opacity: 1 });
+    tl.to(ptr, { y: 100 }, 0.15);
+    tl.to(LN.items, { fill: K.Afill, stroke: K.A }, 0.2, { at: '<', stagger: 0.008 });
+    tl.show(aT, 0.15, { at: '<', stagger: 0.012 });
+    tl.to(cIns.num, { value: 1 }, 0.3, { at: '<' });
+    tl.to(cAdr.num, { value: 32 }, 0.5, { at: '<' });
+    tl.set(nt4, { text: 'one load instruction = 32 addresses' });
+    tl.wait(2.4);
+
+    tl.step('<b>LDG b.</b> The same again for the second operand: one instruction, 32 more addresses, 32 more values.');
+    tl.to(ptr, { y: 126 }, 0.2);
+    tl.to(LN.items, { fill: K.Bfill, stroke: K.B }, 0.2, { at: '<', stagger: 0.008 });
+    tl.show(bT, 0.15, { at: '<', stagger: 0.012 });
+    tl.to(cIns.num, { value: 2 }, 0.3, { at: '<' });
+    tl.to(cAdr.num, { value: 64 }, 0.5, { at: '<' });
+    tl.wait(2.4);
+
+    tl.step('<b>FFMA.</b> One instruction slot, and 32 multiply-adds happen at once — a different product in every lane, each added into that lane’s own running total.');
+    tl.to(ptr, { y: 152 }, 0.2);
+    tl.to(LN.items, { fill: K.tealfill, stroke: K.teal }, 0.2, { at: '<', stagger: 0.008 });
+    tl.show(pT, 0.15, { at: '<', stagger: 0.012 });
+    tl.to(cIns.num, { value: 3 }, 0.3, { at: '<' });
+    tl.to(cRes.num, { value: 32 }, 0.6, { at: '<' });
+    tl.set(nt4, { text: 'one arithmetic instruction = 32 results' });
+    tl.wait(2.6);
+
+    tl.step('So the unit of cost is the <b>warp</b>, not the thread: one instruction slot buys 32 results — or issues 32 addresses, when the instruction is a load. Which 32 addresses is the whole question.');
+    tl.to(ptr, { y: 178 }, 0.2);
+    tl.set(sum1, { text: '3 instructions issued   ·   64 addresses   ·   32 results' });
+    tl.set(sum2, { text: 'and this is one step of k, for one warp, out of 4,092 steps and 524,288 warps' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 3.3 three memories, three distances
+  (function () {
+    const S = MB.scene('a-memories', { w: 900, h: 540, title: 'Three memories and how far away each one is' });
+    const tl = S.tl;
+
+    S.circle({ cx: 110, cy: 62, r: 9, fill: '#5b5750' });
+    S.text({ x: 110, y: 84, text: 'one thread', anchor: 'middle', size: 11, fill: K.muted });
+    S.line({ x1: 110, y1: 96, x2: 110, y2: 418, stroke: K.rule, sw: 1.4, dash: '3 5' });
+
+    function level(y, h, fill, stroke, label, sub) {
+      return S.membox({ x: 190, y, w: 630, h, fill, stroke, rx: 10, labelPos: 'topleft', labelSize: 12.5, label, sub, opacity: 0 });
+    }
+    const REG = level(36, 52, K.goldfill, K.gold, 'registers', 'private to one thread · at most 255 each · 65,536 per SM');
+    const SHM = level(124, 56, K.purplefill, K.purple, 'shared memory', 'a scratchpad on the SM · one block may use 48 KB of its 100 KB');
+    const L2 = level(232, 56, K.greyfill, K.grey, 'L2 cache', '6 MB, shared by all 84 SMs · you cannot choose what it keeps');
+    const GLB = level(352, 64, K.grey2fill, K.grey, 'global memory', '48 GB of GDDR6 at 768 GB/s · where A, B and C live');
+
+    function lat(y, big, small, color) {
+      const a = S.text({ x: 808, y, text: big, anchor: 'end', size: 13, fill: color, weight: 600, opacity: 0 });
+      const b = S.text({ x: 808, y: y + 17, text: small, anchor: 'end', size: 10.5, fill: K.muted, opacity: 0 });
+      return [a, b];
+    }
+    const lr = lat(52, 'same cycle', 'treat it as free', K.gold);
+    const ls = lat(140, '≈ 20–30 cycles', 'on this same SM', K.purple);
+    const l2 = lat(248, '≈ 200 cycles', 'a couple of hundred', K.ink);
+    const lg = lat(374, '400–600 cycles', 'hundreds of cycles', K.red);
+
+    const cCyc = S.counter({ x: 40, y: 448, label: 'cycles since the loads went out', value: 0, size: 26 });
+    const cFma = S.counter({ x: 330, y: 448, label: 'FMAs one lane could have retired meanwhile', value: 0, size: 26 });
+    const ff = S.text({ x: 40, y: 508, text: '', size: 12, fill: K.accent, weight: 600, font: 'mono' });
+    const log1 = S.text({ x: 700, y: 446, text: '', size: 12, fill: K.gold, weight: 600 });
+    const log2 = S.text({ x: 700, y: 468, text: '', size: 12, fill: K.purple, weight: 600 });
+    const log3 = S.text({ x: 700, y: 490, text: '', size: 12, fill: K.red, weight: 600 });
+
+    const pR = S.tile({ x: 104, y: 56, rows: 1, cols: 1, cell: 12, fill: K.gold, stroke: '#fff', sw: 1.2, opacity: 0 });
+    const pS = S.tile({ x: 104, y: 56, rows: 1, cols: 1, cell: 12, fill: K.purple, stroke: '#fff', sw: 1.2, opacity: 0 });
+    const pG = S.tile({ x: 104, y: 56, rows: 1, cols: 1, cell: 12, fill: K.red, stroke: '#fff', sw: 1.2, opacity: 0 });
+
+    tl.step('Three memories, and one thread can address all of them. At <b>cycle 0</b> it issues one load to each: a register, a value in shared memory, a value in the DRAM.');
+    tl.show([REG, SHM, L2, GLB], 0.4, { stagger: 0.14 });
+    tl.show([lr[0], lr[1], ls[0], ls[1], l2[0], l2[1], lg[0], lg[1]], 0.35, { at: '<+0.3', stagger: 0.1 });
+    tl.wait(1.4);
+    tl.show([pR, pS, pG], 0.2);
+    tl.move(pR, 172, 56, 0.3, { at: '<' });
+    tl.move(pS, 172, 146, 0.5, { at: '<', arc: 20 });
+    tl.move(pG, 150, 196, 0.6, { at: '<', arc: 20 });
+    tl.wait(1.3);
+
+    tl.step('The register is <b>already inside the thread</b>. It is there in the cycle the instruction wants it, so a register read costs nothing you can measure. This is the memory the ten kernels fight over.');
+    tl.to(REG.box, { fill: '#f6e6b8' }, 0.3);
+    tl.to(pR, { opacity: 0, scale: 0.4 }, 0.3, { at: '<' });
+    tl.set(log1, { text: 'registers — cycle 0' });
+    tl.wait(2.0);
+
+    tl.step('Shared memory answers after roughly <b>20 to 30 cycles</b>. It is on the same SM, a few millimetres away, and every thread of the block can read what any of them put there.');
+    tl.to(cCyc.num, { value: 25 }, 1.5, { ease: 'linear' });
+    tl.to(cFma.num, { value: 25 }, 1.5, { at: '<', ease: 'linear' });
+    tl.move(pS, 172, 146, 0.6, { at: '<+0.7' });
+    tl.to(SHM.box, { fill: '#ddd2f1' }, 0.3);
+    tl.to(pS, { opacity: 0, scale: 0.4 }, 0.3, { at: '<' });
+    tl.set(log2, { text: 'shared memory — cycle 25' });
+    tl.wait(1.8);
+
+    tl.step('The third load is still travelling. Past the L2 — <b>a couple of hundred cycles</b> if the line happens to be sitting there — and on out to the DRAM, which takes <b>400 to 600</b>. The clock now runs 20× faster.');
+    tl.set(ff, { text: 'clock × 20' });
+    tl.to(cCyc.num, { value: 200 }, 1.1, { ease: 'linear' });
+    tl.to(cFma.num, { value: 200 }, 1.1, { at: '<', ease: 'linear' });
+    tl.move(pG, 172, 254, 1.1, { at: '<' });
+    tl.to(L2.box, { fill: '#e2e2de' }, 0.25);
+    tl.wait(0.5);
+    tl.to(cCyc.num, { value: 500 }, 1.7, { ease: 'linear' });
+    tl.to(cFma.num, { value: 500 }, 1.7, { at: '<', ease: 'linear' });
+    tl.move(pG, 172, 378, 1.7, { at: '<' });
+    tl.to(GLB.box, { fill: '#f0d9d9' }, 0.3);
+    tl.to(pG, { opacity: 0, scale: 0.4 }, 0.3, { at: '<' });
+    tl.set(log3, { text: 'global memory — cycle 500' });
+    tl.set(ff, { text: '' });
+    tl.wait(1.8);
+
+    tl.step('Five hundred cycles is <b>five hundred multiply-adds</b> that lane did not do. A kernel that goes to global memory for every operand is idle almost all of the time — so: fetch fewer bytes, and fetch them into the near memories.');
+    tl.set(ff, { text: 'one lane retires one FMA per clock — chapter 1' });
+    tl.to([lg[0]], { size: 15 }, 0.4);
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 3.4 row-major
+  (function () {
+    const S = MB.scene('a-rowmajor', { w: 900, h: 440, title: 'A matrix flattened row by row onto a one-dimensional memory' });
+    const tl = S.tl;
+    const V = MB.intMatrix(4, 6, 5, 1, 9);
+    const M = S.matrix({ x: 60, y: 76, rows: 4, cols: 6, cell: 34, values: V, label: 'A — 4 rows, 6 columns (K = 6)', labelSize: 12 });
+
+    const t1 = S.text({ x: 310, y: 88, text: 'Memory is one line of bytes.', size: 13.5, fill: K.ink, weight: 600, opacity: 0 });
+    const t2 = S.text({ x: 310, y: 112, text: 'A two-dimensional matrix has to be flattened onto it, and', size: 12, fill: K.muted, opacity: 0 });
+    const t3 = S.text({ x: 310, y: 130, text: 'C and CUDA do it row-major: all of row 0, then all of row 1,', size: 12, fill: K.muted, opacity: 0 });
+    const t4 = S.text({ x: 310, y: 148, text: 'then row 2, laid end to end.', size: 12, fill: K.muted, opacity: 0 });
+    const t5 = S.text({ x: 310, y: 180, text: 'A[i][k]  lives at  base + (i × K + k) × 4 bytes', font: 'mono', size: 13, fill: K.ink, opacity: 0 });
+    const t6 = S.text({ x: 310, y: 200, text: 'K is the number of columns; 4 is sizeof(float).', size: 11, fill: K.muted, opacity: 0 });
+
+    S.text({ x: 60, y: 248, text: 'global memory — one float after another', size: 11.5, fill: K.muted });
+    const T = S.tape({ x: 60, y: 266, n: 24, cell: 32, h: 30, fill: '#fff', stroke: '#ddd9cf' });   // 60..828
+    const tv = [];
+    for (let i = 0; i < 24; i++) {
+      const [cx, cy] = T.center(i);
+      tv.push(S.text({ x: cx, y: cy, text: '' + V[Math.floor(i / 6)][i % 6], anchor: 'middle', size: 13, fill: K.ink, opacity: 0 }));
+    }
+    const brk = [], brkL = [];
+    for (let r = 0; r < 4; r++) {
+      brk.push(S.line({ x1: T.left(6 * r) + 1, y1: 314, x2: T.left(6 * r) + 191, y2: 314, stroke: K.faint, sw: 1, opacity: 0 }));
+      brkL.push(S.text({ x: T.left(6 * r) + 96, y: 328, text: 'row ' + r, anchor: 'middle', size: 10.5, fill: K.muted, opacity: 0 }));
+      S.text({ x: T.left(6 * r), y: 304, text: 'byte ' + (24 * r), size: 9.5, fill: K.faint });
+    }
+    const hit = S.text({ x: 60, y: 362, text: '', font: 'mono', size: 13, fill: K.accent, weight: 600 });
+    const n1 = S.text({ x: 60, y: 392, text: '', size: 12.5, fill: K.A, weight: 600 });
+    const n2 = S.text({ x: 60, y: 414, text: '', size: 12.5, fill: K.red, weight: 600 });
+
+    // flyers: one clone per element
+    const fl = [];
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 6; c++) {
+      const [mx, my] = M.center(r, c);
+      const g = S.group({ tx: mx, ty: my, opacity: 0 });
+      g.rect({ x: -15, y: -13, w: 30, h: 26, fill: K.Afill, stroke: K.A, sw: 1, rx: 3 });
+      g.text({ x: 0, y: 0.5, text: '' + V[r][c], anchor: 'middle', size: 12.5, fill: K.Adeep, weight: 600 });
+      fl.push(g);
+    }
+
+    function dropRow(r, dur, gap) {
+      for (let c = 0; c < 6; c++) {
+        const i = r * 6 + c, g = fl[i];
+        const [tx, ty] = T.center(i);
+        tl.to(M.cellAt(r, c), { fill: K.Afill, stroke: K.A, sw: 1.1 }, 0.15, { at: c === 0 ? undefined : '<+' + gap });
+        tl.show(g, 0.1, { at: '<' });
+        tl.move(g, tx, ty, dur, { at: '<', arc: -22 });
+        tl.hide(g, 0.12);
+        tl.show(tv[i], 0.12, { at: '<' });
+        tl.to(T.cells[i], { fill: '#eef3fc', stroke: K.A }, 0.15, { at: '<' });
+      }
+    }
+
+    tl.step('Memory is one line of bytes, so a two-dimensional matrix has to be flattened onto it. C and CUDA use <b>row-major</b> order: all of row 0, then all of row 1, and so on.');
+    tl.show([t1, t2, t3, t4], 0.4, { stagger: 0.12 });
+    tl.wait(1.8);
+
+    tl.step('Row 0 goes down first, into positions 0 to 5. Then row 1 lands right behind it, at positions 6 to 11, and so on until the matrix is a tape of 24 floats.');
+    dropRow(0, 0.55, 0.16);
+    tl.wait(0.9);
+    dropRow(1, 0.35, 0.09);
+    tl.show([brk[0], brk[1], brkL[0], brkL[1]], 0.3);
+    tl.wait(0.5);
+    dropRow(2, 0.28, 0.06);
+    dropRow(3, 0.28, 0.06);
+    tl.show([brk[2], brk[3], brkL[2], brkL[3]], 0.3);
+    tl.wait(1.5);
+
+    tl.step('So A[i][k] sits at <b>(i × K + k) × 4</b> bytes from the start. With K = 6, A[2][3] is at position 2 × 6 + 3 = <b>15</b>, which is byte 60.');
+    tl.show([t5, t6], 0.4);
+    tl.set(hit, { text: 'A[2][3]:   (2 × 6 + 3) × 4  =  byte 60,  which is position 15' });
+    tl.to(M.cellAt(2, 3), { fill: K.Cfill, stroke: K.C, sw: 1.8 }, 0.4, { at: '<' });
+    tl.to(T.cells[15], { fill: K.Cfill, stroke: K.C, sw: 1.8 }, 0.4, { at: '<' });
+    tl.wait(2.2);
+
+    tl.step('Two neighbors in the same <b>row</b> are next to each other on the tape: <b>4 bytes</b> apart, one float.');
+    tl.to(M.cellAt(2, 4), { fill: '#a9c6f5', stroke: K.A, sw: 1.8 }, 0.3);
+    tl.to(T.cells[16], { fill: '#a9c6f5', stroke: K.A, sw: 1.8 }, 0.3, { at: '<' });
+    tl.set(n1, { text: 'A[2][3] and A[2][4] — same row — 4 bytes apart' });
+    tl.wait(2.2);
+
+    tl.step('Two neighbors in the same <b>column</b> are a whole row apart: <b>K × 4</b> bytes. Six cells here. For the real matrices, with K = 4,092, that is <b>16,368 bytes</b>.');
+    tl.to(M.cellAt(3, 3), { fill: K.redfill, stroke: K.red, sw: 1.8 }, 0.3);
+    tl.to(T.cells[21], { fill: K.redfill, stroke: K.red, sw: 1.8 }, 0.3, { at: '<' });
+    tl.set(n2, { text: 'A[2][3] and A[3][3] — same column — K × 4 = 24 bytes here, 16,368 bytes when K = 4,092' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 3.5 sectors and lines
+  (function () {
+    const S = MB.scene('a-sectors', { w: 900, h: 500, title: 'Sectors, cache lines, and the cost of a warp request' });
+    const tl = S.tl;
+
+    // --- anatomy of a line
+    const lineBar = S.line({ x1: 110, y1: 48, x2: 814, y2: 48, stroke: K.grey, sw: 1, opacity: 0 });
+    const lineLbl = S.text({ x: 462, y: 33, text: 'one 128-byte cache line = 4 sectors', anchor: 'middle', size: 12, fill: K.grey, weight: 600, opacity: 0 });
+    S.text({ x: 104, y: 77, text: 'memory', anchor: 'end', size: 11, fill: K.muted });
+    const T = S.tape({ x: 110, y: 64, n: 32, cell: 22, h: 26, fill: '#fff', stroke: '#ddd9cf' });   // 110..814
+    const secF = [], secL = [];
+    for (let i = 0; i < 4; i++) {
+      secF.push(S.rect({ x: 108 + i * 176, y: 60, w: 180, h: 34, fill: 'none', stroke: K.grey, sw: 1.3, rx: 3, opacity: 0 }));
+      secL.push(S.text({ x: 198 + i * 176, y: 108, text: 'sector ' + i + ' · 32 B · 8 floats', anchor: 'middle', size: 10, fill: K.muted, opacity: 0 }));
+    }
+    const TH1 = S.threads({ x: 740, y: 146, n: 1, size: 24, fill: '#e7e4dc', stroke: '#cfcabf', label: 'one thread', labelPos: 'right', labelSize: 11, opacity: 0 });
+    const cB = S.counter({ x: 110, y: 146, label: 'bytes moved for one float', value: 0, size: 22, fill: K.red, format: v => MB.fmt(v) + ' B' });
+    const cW = S.counter({ x: 290, y: 146, label: 'bytes actually wanted', value: 0, size: 22, fill: K.A, format: v => MB.fmt(v) + ' B' });
+    const cS = S.counter({ x: 470, y: 146, label: 'sectors delivered', value: 0, size: 22 });
+    const note1 = S.text({ x: 110, y: 196, text: '', size: 12.5, fill: K.accent, weight: 600 });
+    const packet = S.tile({ x: 110, y: 64, rows: 1, cols: 8, cell: 21, gap: 1, on: (r, c) => c === 3, fill: K.Afill, stroke: K.A,
+      offFill: K.dead, offStroke: K.faint, frameStroke: K.grey, frameFill: '#fff', opacity: 0 });
+
+    S.line({ x1: 40, y1: 220, x2: 860, y2: 220, stroke: K.rule, sw: 1 });
+
+    // --- panel A: 32 consecutive floats
+    const aT1 = S.text({ x: 50, y: 244, text: 'warp request A — 32 consecutive floats', size: 12.5, fill: K.A, weight: 600, opacity: 0 });
+    const aT2 = S.text({ x: 50, y: 262, text: 'thread i wants a[i]: one row of a matrix', size: 10.5, fill: K.muted, opacity: 0 });
+    const TA = S.tape({ x: 50, y: 286, n: 32, cell: 11, h: 16, fill: '#fff', stroke: '#ddd9cf', opacity: 0 });   // 50..402
+    const aSec = [], aSecL = [];
+    for (let i = 0; i < 4; i++) {
+      aSec.push(S.rect({ x: 48 + i * 88, y: 282, w: 92, h: 24, fill: 'none', stroke: K.grey, sw: 1.1, rx: 2, opacity: 0 }));
+      aSecL.push(S.text({ x: 94 + i * 88, y: 318, text: '32 B', anchor: 'middle', size: 9.5, fill: K.muted, opacity: 0 }));
+    }
+    const cAs = S.counter({ x: 50, y: 356, label: 'sectors touched', value: 0, size: 22, opacity: 0 });
+    const cAb = S.counter({ x: 190, y: 356, label: 'bytes moved', value: 0, size: 22, format: v => MB.fmt(v) + ' B', opacity: 0 });
+    const cAu = S.counter({ x: 320, y: 356, label: 'of them used', value: 0, size: 22, fill: K.B, format: v => v.toFixed(1) + '%', opacity: 0 });
+
+    // --- panel B: 32 floats, one per row
+    const bT1 = S.text({ x: 460, y: 244, text: 'warp request B — 32 floats, 16,368 B apart', size: 12.5, fill: K.red, weight: 600, opacity: 0 });
+    const bT2 = S.text({ x: 460, y: 262, text: 'thread i wants A[i][0]: one column of the same matrix', size: 10.5, fill: K.muted, opacity: 0 });
+    const frag = [];
+    for (let i = 0; i < 32; i++) {
+      const fx = 460 + (i % 8) * 48, fy = 278 + Math.floor(i / 8) * 14;
+      frag.push(S.tile({ x: fx, y: fy, rows: 1, cols: 8, cell: 5, gap: 0.5, on: (r, c) => c === 0, fill: K.A, stroke: K.Adeep, sw: 0.5,
+        offFill: K.dead, offStroke: K.faint, frameStroke: K.grey, frameFill: '#fff', opacity: 0 }));
+    }
+    const bNote = S.text({ x: 460, y: 336, text: 'no two of the wanted floats share a sector', size: 10, fill: K.muted, opacity: 0 });
+    const cBs = S.counter({ x: 460, y: 356, label: 'sectors touched', value: 0, size: 22, fill: K.red, opacity: 0 });
+    const cBb = S.counter({ x: 600, y: 356, label: 'bytes moved', value: 0, size: 22, fill: K.red, format: v => MB.fmt(v) + ' B', opacity: 0 });
+    const cBu = S.counter({ x: 730, y: 356, label: 'of them used', value: 0, size: 22, fill: K.red, format: v => v.toFixed(1) + '%', opacity: 0 });
+
+    const barA = S.bar({ x: 180, y: 414, w: 0, h: 16, fill: K.Afill, stroke: K.A, label: 'request A', value: 0, format: v => MB.fmt(v) + ' B', opacity: 0 });
+    const barB = S.bar({ x: 180, y: 442, w: 0, h: 16, fill: K.redfill, stroke: K.red, label: 'request B', value: 0, format: v => MB.fmt(v) + ' B', opacity: 0 });
+    const verdict = S.text({ x: 180, y: 480, text: '', size: 13, fill: K.ink, weight: 600 });
+
+    tl.step('The smallest thing the memory system will deliver is a <b>32-byte sector</b>: eight consecutive floats. A thread asks for one float — cell 3 here — and the whole sector comes back.');
+    tl.show([TH1, secF[0]], 0.4);
+    tl.to(T.cells[3], { fill: K.Afill, stroke: K.A, sw: 1.3 }, 0.3, { at: '<' });
+    tl.show(packet, 0.15);
+    tl.move(packet, 665, 146, 0.9, { arc: -50 });
+    tl.to(packet, { opacity: 0, scale: 0.35 }, 0.3);
+    tl.to(TH1.items[0], { fill: K.Afill, stroke: K.A }, 0.25, { at: '<' });
+    tl.to(cB.num, { value: 32 }, 0.4, { at: '<' });
+    tl.to(cW.num, { value: 4 }, 0.4, { at: '<' });
+    tl.to(cS.num, { value: 1 }, 0.4, { at: '<' });
+    tl.set(note1, { text: 'ask for 4 bytes, get 32 — the other seven floats travelled for nothing' });
+    tl.wait(2.0);
+
+    tl.step('Sectors tile the whole of memory, and four of them in a row make a <b>128-byte cache line</b>. Everything the memory system does is counted in these units, never in floats.');
+    tl.show(secF.slice(1), 0.3, { stagger: 0.1 });
+    tl.show(secL, 0.3, { at: '<', stagger: 0.06 });
+    tl.show([lineBar, lineLbl], 0.4);
+    tl.wait(2.0);
+
+    tl.step('Now a whole warp. <b>Request A</b>: its 32 threads want 32 consecutive floats. Those 128 bytes lie in <b>four sectors</b>, and every byte that moves is a byte somebody wanted.');
+    tl.show([aT1, aT2, TA, cAs, cAb, cAu], 0.4);
+    tl.to(TA.cells, { fill: K.Afill, stroke: K.A }, 0.15, { stagger: 0.012 });
+    tl.show(aSec, 0.3, { at: '<+0.2', stagger: 0.08 });
+    tl.show(aSecL, 0.3, { at: '<', stagger: 0.06 });
+    tl.to(cAs.num, { value: 4 }, 0.6);
+    tl.to(cAb.num, { value: 128 }, 0.6, { at: '<' });
+    tl.to(cAu.num, { value: 100 }, 0.6, { at: '<' });
+    tl.wait(2.2);
+
+    tl.step('<b>Request B</b>: the same 32 floats-worth of demand, but one from each of 32 rows, 16,368 bytes apart. Every one lands in a sector of its own: <b>32 sectors, 1,024 bytes</b>, for 128 bytes of use.');
+    tl.show([bT1, bT2, cBs, cBb, cBu], 0.4);
+    tl.show(frag, 0.12, { stagger: 0.035 });
+    tl.show(bNote, 0.3);
+    tl.to(cBs.num, { value: 32 }, 1.0, { at: '<-0.6', ease: 'linear' });
+    tl.to(cBb.num, { value: 1024 }, 1.0, { at: '<', ease: 'linear' });
+    tl.to(cBu.num, { value: 12.5 }, 1.0, { at: '<', ease: 'linear' });
+    tl.wait(2.2);
+
+    tl.step('Same 32 floats, same instruction, <b>eight times the traffic</b> — decided entirely by which addresses went out together. Chapter 4 watches kernel 1 fall into exactly this trap; chapter 5 climbs out of it.');
+    tl.show([barA, barB], 0.3);
+    barA.grow(tl, 560 * 128 / 1024, 128, 0.9);
+    barB.grow(tl, 560, 1024, 0.9, { at: '<' });
+    tl.set(verdict, { text: '1,024 ÷ 128 = 8× the bytes, for the same 32 wanted floats' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

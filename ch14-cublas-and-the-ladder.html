@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cuBLAS, the last 6%, and the whole ladder · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 14 · <em>The last mile</em></div>
+<h1>cuBLAS, the last 6%, and the whole ladder in one view</h1>
+<p class="lede">Ten kernels in, we are at 93.7% of a library that has had two decades of engineers on it. The remaining gap is instructive, because it is not one clever trick. Then the whole climb on one chart, with the three regimes marked.</p>
+<div class="byline">Reference · <em>cuBLAS</em> · 23,250 GFLOP/s · 100% by definition · 78% of the 30 TFLOP/s the chip can do</div>
+
+<p>Kernel 10 is one file, and on the 4,092 × 4,092 problem it runs within about six percent of cuBLAS. It's worth being clear about what that six percent is, because the temptation is to imagine one more optimization that closes it. There isn't one. The gap is three structural things a library does that a single kernel doesn't, and this chapter animates each of them. Then it puts all ten kernels back on the roofline from chapter 2 and on one ladder, so the whole argument of the book can be read off a single picture.</p>
+
+<h2><span class="no">14.1</span>cuBLAS is not one kernel</h2>
+
+<p>Boehm profiled what cuBLAS actually launches for a square multiply at different sizes, and the answer changes with the size. At 128 and 512 it runs a kernel with 32 × 32 tiles. At 256 it runs a 64 × 32 kernel and then a second, separate kernel called a split-K reduce. From 1,024 upward it switches to a 128 × 64 kernel. On Ampere the library carries around sixteen different SGEMM kernels and picks between them at runtime based on the matrix shapes. Our kernel 10 is tuned for one shape; cuBLAS carries a tuned kernel for practically every shape, which is chapter 12's autotuning taken to its logical conclusion.</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>Matrix size</th><th>What cuBLAS launches</th><th>Time</th></tr>
+<tr><td>128</td><td>ampere_sgemm_32x32_sliced1x4_nn</td><td>15.3 µs</td></tr>
+<tr><td>256</td><td>ampere_sgemm_64x32_sliced1x4_nn, then splitKreduce_kernel</td><td>12.4 µs + 6.9 µs</td></tr>
+<tr><td>512</td><td>ampere_sgemm_32x32_sliced1x4_nn</td><td>41.7 µs</td></tr>
+<tr><td>1,024</td><td>ampere_sgemm_128x64_nn</td><td>166 µs</td></tr>
+<tr><td>2,048</td><td>ampere_sgemm_128x64_nn</td><td>1.25 ms</td></tr>
+<tr><td>4,096</td><td>ampere_sgemm_128x64_nn</td><td>9.29 ms</td></tr>
+</table>
+</div>
+
+<p>Why smaller tiles for smaller problems? Because a tile is also a block, and a block runs on one SM. With 128 × 128 tiles, a 128 × 128 multiply is a single block: one SM working, eighty-three idle. The animation counts how many of the 84 SMs each problem size can keep busy, and it is the reason our kernel 10 is competitive at 2,048 and 4,096, within 1–6% of cuBLAS, and far behind at 128 to 512.</p>
+
+<figure class="wide">
+  <div id="a-fill"></div>
+  <figcaption><b>Figure 14.1.</b> How many blocks a problem produces at 128 × 128 tiles, against the 84 SMs that need work. Small problems cannot fill the machine with big tiles; cuBLAS switches to smaller tiles, and at 256 it splits K as well.</figcaption>
+</figure>
+
+<h2><span class="no">14.2</span>It changes strategy for awkward shapes: split-K</h2>
+
+<p>When the matrices are small or thin there is not enough independent work to fill 84 SMs, however you tile the output. cuBLAS then splits the k dimension instead: several blocks each compute a <em>partial</em> sum over their own slice of k for the same tile of C, and a second pass adds the partials. More total work, more memory traffic, and a better-filled machine. For the 256 × 256 case that second pass is the splitKreduce_kernel in the table.</p>
+
+<figure class="wide">
+  <div id="a-splitk"></div>
+  <figcaption><b>Figure 14.2.</b> Split-K. One block walking the whole k dimension becomes four blocks each walking a quarter, followed by a reduce that adds the four partial tiles. The extra traffic is the partials; the gain is four SMs busy instead of one.</figcaption>
+</figure>
+
+<h2><span class="no">14.3</span>It overlaps the loads with the arithmetic</h2>
+
+<p>Our kernels have a rhythm that has not changed since kernel 3: load a chunk into shared memory, barrier, compute on it, barrier, load the next chunk. While the block is loading, its lanes are idle; while it is computing, the memory system is idle. cuBLAS prefetches. It keeps two chunks' worth of shared memory, and while computing on chunk n it is already fetching chunk n + 1 into the other buffer, so the arithmetic units rarely stop. This is called double buffering, and it is the main structural idea the ten kernels skipped.</p>
+
+<figure class="wide">
+  <div id="a-prefetch"></div>
+  <figcaption><b>Figure 14.3.</b> The chunk loop, serial and double-buffered. Same loads, same arithmetic; in the second timeline the load of chunk n + 1 hides behind the compute of chunk n, and the lanes stay busy.</figcaption>
+</figure>
+
+<h2><span class="no">14.4</span>And even cuBLAS is at 78%</h2>
+
+<p>cuBLAS reaches 23,250 GFLOP/s on this problem, and the chip's fp32 lanes could do 30,000. The last fifth goes to things no amount of software removes: the k-loop's own bookkeeping instructions, the barriers, the tails at the matrix edges, the gaps between one block finishing and the next starting, and the fact that a real instruction stream cannot keep every lane fed on every cycle. The one way past that ceiling is to stop doing fp32 arithmetic on the lanes at all and use the tensor cores, which is a different instruction set, a different precision, and a different book.</p>
+
+<h2><span class="no">14.5</span>The roofline, revisited</h2>
+
+<p>Chapter 2 promised to come back to the roofline with all ten kernels on it. Here they are, with one caveat that matters. The intensity plotted is the bytes each kernel's SMs <em>request</em> from the memory system per FLOP, which is what the kernel controls; the L2 cache serves many of those requests, so DRAM sees fewer bytes than the axis says. That is why kernels 1 and 2 float above the DRAM roof: their re-reads mostly hit L2. From kernel 3 on, the dots sit under the DRAM roof and climb toward the compute roof, which is the picture of a kernel limited by instructions, not by bytes.</p>
+
+<figure class="wide">
+  <div id="a-roofline"></div>
+  <figcaption><b>Figure 14.4.</b> The ten kernels on the roofline. Intensity counts the bytes the SMs request per FLOP. Kernels 5 to 10 all request the same bytes (a 128 × 128 block tile gives 32 FLOP per byte) and differ only in how many instructions they spend; their climb is vertical.</figcaption>
+</figure>
+
+<h2><span class="no">14.6</span>The whole ladder in one view</h2>
+
+<figure class="wide">
+  <div id="a-ladder"></div>
+  <figcaption><b>Figure 14.5.</b> The journey, with the three regimes marked. The whole first half of the climb is about not being memory-starved; the middle is about feeding the lanes with fewer instructions; only the last four kernels are working against the machine's own shape.</figcaption>
+</figure>
+
+<div class="tablewrap">
+<table>
+<tr><th>Kernel</th><th>What changed</th><th>The mechanism, in one line</th><th>GFLOP/s</th></tr>
+<tr><td>1 naive</td><td>—</td><td>32 scattered sectors per warp: 1,056 B for 64 FLOPs</td><td>309</td></tr>
+<tr><td>2 coalescing</td><td>swap two index lines</td><td>one 128 B run per warp: 160 B for 64 FLOPs</td><td>1,986</td></tr>
+<tr><td>3 shared memory</td><td>stage tiles in shared memory</td><td>DRAM reads per output: 8,184 → 256</td><td>2,980</td></tr>
+<tr><td>4 1D blocktiling</td><td>8 outputs per thread</td><td>shared loads per FMA: 2.00 → 1.125</td><td>8,475</td></tr>
+<tr><td>5 2D blocktiling</td><td>8 × 8 outputs per thread</td><td>shared loads per FMA: 1.125 → 0.25 (the outer product)</td><td>15,972</td></tr>
+<tr><td>6 vectorized</td><td>float4 loads, transposed As</td><td>four load instructions become one</td><td>18,237</td></tr>
+<tr><td>9 autotuning</td><td>search the tile shapes</td><td>the optimum is a property of the chip</td><td>19,721</td></tr>
+<tr><td>10 warptiling</td><td>an explicit warp-level tile</td><td>0.1875 loads per FMA, warp-shaped reads</td><td>21,779</td></tr>
+<tr><td>cuBLAS</td><td>many kernels, prefetching, split-K</td><td>the reference</td><td>23,250</td></tr>
+</table>
+</div>
+
+<p>Reading down the third column, the same idea appears in different clothes each time. Kernel 2 is about the shape of a request. Kernel 3 is about not asking twice. Kernels 4 and 5 are about getting more arithmetic out of each thing you asked for. Kernel 6 is about asking in fewer instructions. Kernels 9 and 10 are about fitting the request to the specific machine. Underneath all of them is the sentence from chapter 2.</p>
+
+<div class="key">
+  <div class="t">The one sentence, one last time</div>
+  <p>Every kernel in this book does the same 137 GFLOP of arithmetic. What changed, every single time, was how many bytes had to move to feed it, and how many instructions were spent moving them. Performance is the ratio between arithmetic and traffic, and each rewrite raised that ratio.</p>
+</div>
+
+<p>If you want to go further, the natural next steps are Boehm's own <a href="https://github.com/siboehm/SGEMM_CUDA">repository</a>, where every kernel here is a compilable file you can profile yourself, and NVIDIA's <a href="https://github.com/NVIDIA/cutlass">CUTLASS</a>, which is what a production-grade version of kernel 10 looks like when generalized to every shape and precision. And if any of the hardware words in this book still feel like vocabulary rather than machinery, the <a href="https://vizuaraai.github.io/cuda-programming-model/">first post</a> builds all of them from a photograph of a dog.</p>
+
+<div class="pager"></div>
+<div class="colophon"><b>Sources.</b> Simon Boehm, "How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog", and the SGEMM_CUDA repository: every GFLOP/s figure, the cuBLAS kernel names and timings by size, the split-K observation, and the profiler findings quoted across the book are his measurements on an NVIDIA A6000. Stephen Jones, "How CUDA Programming Works" (GTC 2022), for the hardware model. NVIDIA's CUDA C++ Programming Guide for coalescing rules, shared-memory limits and vector-load requirements. <b>Colophon.</b> The animations are plain SVG driven by a small timeline engine written for this book; every number they display is computed in the page from the shared 8 × 8 example, from 32-byte sector arithmetic, or from the measurements above. The roofline intensities are SM-side request counts derived from each kernel's tile sizes. Built by Vizuara, September 2026.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 14.1 filling 84 SMs
+  (function () {
+    const S = MB.scene('a-fill', { w: 900, h: 440, title: 'How many blocks fill 84 SMs' });
+    const tl = S.tl;
+    const sx = 500, sy = 60, sw = 24, sg = 5;
+    S.text({ x: sx, y: sy - 16, text: '84 SMs', size: 12.5, fill: K.ink, weight: 600 });
+    const sms = [];
+    for (let i = 0; i < 84; i++) sms.push(S.rect({ x: sx + (i % 12) * (sw + sg), y: sy + Math.floor(i / 12) * (sw + sg), w: sw, h: sw, fill: '#f1efe8', stroke: '#d8d2c6', rx: 3 }));
+    const busy = S.counter({ x: sx, y: 290, label: 'SMs with work', value: 0, size: 26, format: v => Math.round(v) + ' of 84' });
+    const pct = S.counter({ x: sx + 200, y: 290, label: 'of the machine', value: 0, size: 26, fill: K.accent, format: v => v.toFixed(0) + '%' });
+    // left: the C matrix at the current size, tiled 128x128
+    const mx = 60, my = 60, M = 300;
+    S.text({ x: mx, y: my - 16, text: 'C, tiled 128 × 128', size: 12.5, fill: K.ink, weight: 600 });
+    const frame = S.rect({ x: mx, y: my, w: M, h: M, fill: '#fdf8f2', stroke: K.C, sw: 1, rx: 2 });
+    const grid = [];
+    const nlab = S.text({ x: mx, y: my + M + 18, text: '', size: 12, fill: K.ink, weight: 600 });
+    const blab = S.text({ x: mx, y: my + M + 38, text: '', size: 11.5, fill: K.muted });
+    const note = S.text({ x: mx, y: my + M + 68, text: '', size: 12, fill: K.accent, weight: 600 });
+    const sizes = [128, 256, 512, 1024, 2048, 4092];
+    const caps = [
+      'A <b>128 × 128</b> multiply at 128 × 128 tiles is one block: one SM busy, eighty-three idle. That is why big-tile kernels lose badly on small problems.',
+      '<b>256 × 256</b>: four blocks, four SMs. cuBLAS uses 64 × 32 tiles here and splits K as well, to get to dozens of blocks.',
+      '<b>512 × 512</b>: sixteen blocks. cuBLAS switches to 32 × 32 tiles: 256 blocks, three per SM.',
+      '<b>1,024 × 1,024</b>: sixty-four blocks, still short of 84 SMs. cuBLAS moves to 128 × 64 tiles from here on.',
+      '<b>2,048 × 2,048</b>: 256 blocks, every SM busy with three. Kernel 10 is within a few percent of cuBLAS from here.',
+      '<b>4,092 × 4,092</b>: 1,024 blocks, twelve per SM. This is the book’s problem, and the one our tiles were chosen for.',
+    ];
+    sizes.forEach((N, k) => {
+      const nb = Math.ceil(N / 128), blocks = nb * nb, on = Math.min(84, blocks);
+      tl.step(caps[k]);
+      const t0 = tl.cursor;   // absolute schedule for this size (see ENGINE.md timing gotcha)
+      grid.forEach(g => tl.hide(g, 0.15, { at: t0 }));
+      const cell = M / nb;
+      const cells = [];
+      for (let r = 0; r < nb; r++) for (let c = 0; c < nb; c++) cells.push(S.rect({ x: mx + c * cell, y: my + r * cell, w: cell - (nb > 16 ? 0.5 : 1.5), h: cell - (nb > 16 ? 0.5 : 1.5), fill: K.Cfill, stroke: K.C, sw: nb > 16 ? 0.3 : 0.7, rx: 1, opacity: 0 }));
+      grid.length = 0; grid.push(...cells);
+      tl.show(cells, 0.15, { at: t0 + 0.15, stagger: Math.min(0.01, 0.8 / cells.length) });
+      tl.set(nlab, { text: `N = ${MB.fmt(N)}: ${nb} × ${nb} = ${MB.fmt(blocks)} blocks` }, t0 + 0.15);
+      tl.set(blab, { text: blocks > 84 ? `${(blocks / 84).toFixed(1)} blocks per SM` : `${84 - blocks} SMs have nothing to do` }, t0 + 0.15);
+      tl.to(sms, { fill: '#f1efe8', stroke: '#d8d2c6' }, 0.1, { at: t0 });
+      tl.to(sms.slice(0, on), { fill: K.tealfill, stroke: K.teal }, 0.12, { at: t0 + 0.2, stagger: 0.008 });
+      tl.to(busy.num, { value: on }, 0.5, { at: t0 + 0.2 });
+      tl.to(pct.num, { value: 100 * on / 84 }, 0.5, { at: t0 + 0.2 });
+      tl.cursor = t0 + 0.2 + Math.max(0.5, 0.12 + on * 0.008);
+      tl.set(note, { text: [
+        'cuBLAS picks: 32 × 32 tiles → 16 blocks',
+        'cuBLAS picks: 64 × 32 tiles + split-K → many more blocks, then a reduce',
+        'cuBLAS picks: 32 × 32 tiles → 256 blocks',
+        'cuBLAS picks: 128 × 64 tiles → 128 blocks',
+        'cuBLAS picks: 128 × 64 tiles → 512 blocks',
+        'cuBLAS picks: 128 × 64 tiles → 2,048 blocks',
+      ][k] }, '<');
+      tl.wait(2.2);
+    });
+    tl.step('The tile that is right for the big problem starves the small one. A library cannot ship one kernel; it ships a family and picks by shape at runtime.');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 14.2 split-K
+  (function () {
+    const S = MB.scene('a-splitk', { w: 900, h: 430, title: 'Split-K' });
+    const tl = S.tl;
+    // left: one block, whole K
+    const y0 = 70;
+    S.text({ x: 40, y: 40, text: 'one block, the whole k dimension', size: 12.5, fill: K.ink, weight: 600 });
+    const A1 = S.rect({ x: 40, y: y0, w: 240, h: 40, fill: K.Afill, stroke: K.A, rx: 2 });
+    S.text({ x: 160, y: y0 + 20, text: 'A row strip · k = 0 … K', anchor: 'middle', size: 10.5, fill: K.Adeep });
+    const B1 = S.rect({ x: 300, y: y0, w: 40, h: 120, fill: K.Bfill, stroke: K.B, rx: 2 });
+    S.text({ x: 320, y: y0 + 135, text: 'B', anchor: 'middle', size: 10.5, fill: K.Bdeep });
+    const C1 = S.rect({ x: 360, y: y0, w: 40, h: 40, fill: '#fff', stroke: K.C, rx: 2 });
+    const b1 = S.text({ x: 40, y: y0 + 160, text: '1 block · 1 SM busy · walks all of K', size: 11.5, fill: K.muted });
+    // right: four blocks, quarter of K each
+    const x2 = 470;
+    S.text({ x: x2, y: 40, text: 'split-K: four blocks, a quarter of k each', size: 12.5, fill: K.ink, weight: 600 });
+    const segs = [], Bsegs = [], parts = [];
+    for (let i = 0; i < 4; i++) {
+      segs.push(S.rect({ x: x2 + i * 62, y: y0, w: 58, h: 40, fill: K.Afill, stroke: K.A, rx: 2, opacity: 0 }));
+      Bsegs.push(S.rect({ x: x2 + 250 + i * 10, y: y0 + i * 30, w: 40, h: 28, fill: K.Bfill, stroke: K.B, rx: 2, opacity: 0 }));
+      parts.push(S.rect({ x: x2 + i * 62, y: y0 + 60, w: 40, h: 40, fill: '#fff', stroke: K.C, rx: 2, opacity: 0 }));
+    }
+    const plabel = parts.map((p, i) => S.text({ x: x2 + i * 62 + 20, y: y0 + 80, text: 'C' + i, anchor: 'middle', size: 11, fill: K.C, weight: 600, opacity: 0 }));
+    const sum = S.rect({ x: x2 + 300, y: y0 + 60, w: 40, h: 40, fill: '#fff', stroke: K.C, sw: 1.5, rx: 2, opacity: 0 });
+    const sumL = S.text({ x: x2 + 320, y: y0 + 80, text: 'C', anchor: 'middle', size: 11, fill: K.C, weight: 600, opacity: 0 });
+    const plus = S.text({ x: x2 + 125, y: y0 + 130, text: '', size: 12, fill: K.ink, font: 'mono' });
+    const b2 = S.text({ x: x2, y: y0 + 160, text: '', size: 11.5, fill: K.muted });
+    const cost = S.text({ x: 40, y: 300, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const cost2 = S.text({ x: 40, y: 322, text: '', size: 12, fill: K.muted });
+    const cost3 = S.text({ x: 40, y: 344, text: '', size: 12, fill: K.muted });
+    const arrows = parts.map((p, i) => S.line({ x1: x2 + i * 62 + 40, y1: y0 + 80, x2: x2 + 296, y2: y0 + 80, stroke: K.C, sw: 1, arrow: true, opacity: 0 }));
+
+    tl.step('One tile of C is normally one block’s job: it walks the whole k dimension, all 4,092 steps, and writes the finished tile. One block, one SM.');
+    tl.wait(1.6);
+    tl.step('Split-K gives the same tile to <b>four blocks</b>, each walking a quarter of k. Each produces a partial tile: the sum over its own k range.');
+    tl.show(segs, 0.25, { stagger: 0.12 }); tl.show(Bsegs, 0.25, { at: '<', stagger: 0.12 });
+    tl.show(parts, 0.25, { stagger: 0.12 }); tl.show(plabel, 0.25, { at: '<', stagger: 0.12 });
+    tl.set(b2, { text: '4 blocks · 4 SMs busy · each walks K/4' });
+    tl.wait(1.6);
+    tl.step('A second kernel, the <b>reduce</b>, adds the four partials into C. The extra cost is four partial tiles written and read back; the gain is four SMs busy where one was.');
+    tl.show(arrows, 0.3, { stagger: 0.1 }); tl.show([sum, sumL], 0.3);
+    tl.set(plus, { text: 'C = C0 + C1 + C2 + C3' });
+    tl.set(cost, { text: 'more total work and traffic, better machine utilization, faster wall clock — for small or thin problems' });
+    tl.set(cost2, { text: 'at N = 256 cuBLAS launches ampere_sgemm_64x32_sliced1x4_nn and then splitKreduce_kernel: 12.4 µs + 6.9 µs' });
+    tl.set(cost3, { text: 'for the 4,092 × 4,092 problem there are 1,024 tiles already, so no split is needed' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 14.3 double buffering
+  (function () {
+    const S = MB.scene('a-prefetch', { w: 900, h: 400, title: 'Serial chunk loop against double buffering' });
+    const tl = S.tl;
+    const x0 = 210, u = 26; // px per time unit; load = 2 units, compute = 3 units
+    S.text({ x: x0, y: 40, text: 'time →', size: 11, fill: K.muted });
+    function lane(y, name, sub) { S.text({ x: x0 - 12, y: y + 12, text: name, anchor: 'end', size: 12.5, fill: K.ink, weight: 600 }); S.text({ x: x0 - 12, y: y + 28, text: sub, anchor: 'end', size: 10.5, fill: K.muted }); }
+    lane(70, 'our kernels', 'load · sync · compute · sync');
+    lane(200, 'double buffered', 'two buffers in shared memory');
+    const serial = [], dbl = [];
+    let t = 0;
+    for (let n = 0; n < 4; n++) {
+      serial.push({ kind: 'load', n, t0: t, d: 2 }); t += 2;
+      serial.push({ kind: 'comp', n, t0: t, d: 3 }); t += 3;
+    }
+    const serialEnd = t;
+    // double buffered: load0; then for n: compute n overlaps load n+1 (compute 3 units, load 2 units)
+    let td = 0; dbl.push({ kind: 'load', n: 0, t0: 0, d: 2 }); td = 2;
+    for (let n = 0; n < 4; n++) { dbl.push({ kind: 'comp', n, t0: td, d: 3 }); if (n < 3) dbl.push({ kind: 'load', n: n + 1, t0: td, d: 2, row: 1 }); td += 3; }
+    const dblEnd = td;
+    function box(item, y, row) {
+      const isL = item.kind === 'load';
+      const g = S.group({ tx: x0 + item.t0 * u, ty: y + (row ? 22 : 0), opacity: 0 });
+      g.rect({ x: 1, y: 0, w: item.d * u - 2, h: 20, fill: isL ? K.greyfill : K.tealfill, stroke: isL ? K.grey : K.teal, rx: 3 });
+      g.text({ x: item.d * u / 2, y: 10.5, text: (isL ? 'load ' : 'compute ') + item.n, anchor: 'middle', size: 9.5, fill: isL ? K.muted : K.teal, weight: 600 });
+      return g;
+    }
+    const sb = serial.map(it => box(it, 70, 0));
+    const db = dbl.map(it => box(it, 200, it.row));
+    const sEnd = S.text({ x: x0 + serialEnd * u + 8, y: 80, text: '', size: 11.5, fill: K.red, weight: 600 });
+    const dEnd = S.text({ x: x0 + dblEnd * u + 8, y: 210, text: '', size: 11.5, fill: K.green, weight: 600 });
+    const sUse = S.counter({ x: x0, y: 120, label: 'lanes busy (serial)', value: 0, size: 18, format: v => v.toFixed(0) + '%' });
+    const dUse = S.counter({ x: x0, y: 262, label: 'lanes busy (double buffered)', value: 0, size: 18, fill: K.green, format: v => v.toFixed(0) + '%' });
+    const note = S.text({ x: 40, y: 330, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 352, text: '', size: 12, fill: K.muted });
+
+    tl.step('Our chunk loop is serial: load a chunk, barrier, compute on it, barrier, load the next. While the block loads, its lanes are idle; while it computes, the memory system is idle.');
+    sb.forEach((g, i) => tl.show(g, 0.2, { at: i === 0 ? '>' : '<+0.28' }));
+    tl.set(sEnd, { text: '20 units' });
+    tl.to(sUse.num, { value: 60 }, 0.6);
+    tl.wait(1.6);
+    tl.step('Double buffering keeps two chunks in shared memory. While computing on chunk n, the block is already fetching chunk n + 1 into the other buffer.');
+    db.forEach((g, i) => tl.show(g, 0.2, { at: i === 0 ? '>' : '<+0.22' }));
+    tl.set(dEnd, { text: '14 units' });
+    tl.to(dUse.num, { value: 86 }, 0.6);
+    tl.wait(1.6);
+    tl.step('Same loads, same arithmetic. The loads hide behind the compute, and the lanes rarely stop. This is the main structural idea the ten kernels skipped, and cuBLAS does it.');
+    tl.set(note, { text: 'with load = 2 units and compute = 3 (illustrative), four chunks take 20 units serially and 14 double buffered' });
+    tl.set(note2, { text: 'the price: twice the shared memory per block, and the bookkeeping to swap buffers safely' });
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 14.4 roofline revisited
+  (function () {
+    const S = MB.scene('a-roofline', { w: 900, h: 540, title: 'The ten kernels on the roofline' });
+    const tl = S.tl;
+    const px = 90, py = 40, pw = 720, ph = 400;
+    const xmin = 0.02, xmax = 2000, ymin = 0.1, ymax = 100; // FLOP/B, TFLOP/s
+    const X = v => px + pw * (Math.log10(v) - Math.log10(xmin)) / (Math.log10(xmax) - Math.log10(xmin));
+    const Y = v => py + ph - ph * (Math.log10(v) - Math.log10(ymin)) / (Math.log10(ymax) - Math.log10(ymin));
+    // grid
+    [0.1, 1, 10, 100, 1000].forEach(v => { S.line({ x1: X(v), y1: py, x2: X(v), y2: py + ph, stroke: '#eeebe3', sw: 1 }); S.text({ x: X(v), y: py + ph + 16, text: '' + v, anchor: 'middle', size: 10.5, fill: K.muted }); });
+    [0.1, 1, 10, 100].forEach(v => { S.line({ x1: px, y1: Y(v), x2: px + pw, y2: Y(v), stroke: '#eeebe3', sw: 1 }); S.text({ x: px - 8, y: Y(v), text: '' + v, anchor: 'end', size: 10.5, fill: K.muted }); });
+    S.text({ x: px + pw / 2, y: py + ph + 36, text: 'arithmetic intensity: FLOPs per byte the SMs request', anchor: 'middle', size: 11.5, fill: K.ink });
+    S.text({ x: 24, y: py + ph / 2, text: 'TFLOP/s', anchor: 'middle', size: 11.5, fill: K.ink, rot: -90 }).pivot(24, py + ph / 2);
+    S.rect({ x: px, y: py, w: pw, h: ph, fill: 'none', stroke: K.rule });
+    // roofs
+    const ridge = 30 / 0.768; // 39 FLOP/B
+    const memRoof = S.line({ x1: X(xmin), y1: Y(0.768 * xmin), x2: X(ridge), y2: Y(30), stroke: K.grey, sw: 1.8, opacity: 0 });
+    const compRoof = S.line({ x1: X(ridge), y1: Y(30), x2: X(xmax), y2: Y(30), stroke: K.teal, sw: 1.8, opacity: 0 });
+    const ridgeL = S.text({ x: X(ridge), y: Y(30) - 12, text: 'ridge: 39 FLOP/B', anchor: 'middle', size: 10.5, fill: K.ink, opacity: 0 });
+    const memL = S.text({ x: X(0.3), y: Y(0.768 * 0.3) - 12, text: 'DRAM roof: 768 GB/s × intensity', size: 10.5, fill: K.grey, opacity: 0 });
+    const compL = S.text({ x: X(800), y: Y(30) + 14, text: 'compute roof: 30 TFLOP/s', anchor: 'end', size: 10.5, fill: K.teal, opacity: 0 });
+    const cuL = S.line({ x1: X(ridge), y1: Y(23.25), x2: X(xmax), y2: Y(23.25), stroke: K.C, sw: 1, dash: '4 3', opacity: 0 });
+    const cuT = S.text({ x: X(ridge) + 14, y: Y(23.25) + 14, text: 'cuBLAS: 23.25', size: 10.5, fill: K.C, opacity: 0 });
+    // kernels: intensity (FLOP per byte requested), measured TFLOP/s
+    const ks = [
+      { n: 'K1', i: 64 / 1056, g: 0.309 }, { n: 'K2', i: 64 / 160, g: 1.9865 }, { n: 'K3', i: 8, g: 2.9803 }, { n: 'K4', i: 16, g: 8.4747 },
+      { n: 'K5', i: 32, g: 15.9717 }, { n: 'K6', i: 32, g: 18.2373 }, { n: 'K9', i: 32, g: 19.721 }, { n: 'K10', i: 32, g: 21.7793 },
+    ];
+    const dots = ks.map(k => S.circle({ cx: X(k.i), cy: Y(k.g), r: 5, fill: K.C, stroke: '#fff', sw: 1.2, opacity: 0 }));
+    const labs = ks.map((k, j) => S.text({ x: X(k.i) + 8, y: Y(k.g) - 8, text: j === 4 ? 'K5, K6, K9, K10 (bottom to top) →' : (j > 4 ? '' : k.n), size: 10.5, fill: K.ink, weight: 600, opacity: 0 }));
+    labs[4].setNow({ x: X(32) - 10, y: Y(18.5), anchor: 'end' });
+    const note = S.text({ x: px + 12, y: py + 18, text: '', size: 11.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: px + 12, y: py + 36, text: '', size: 11, fill: K.muted });
+
+    tl.step('The machine again: the DRAM roof rising at 768 GB/s per FLOP-per-byte, the compute roof flat at 30 TFLOP/s, and the ridge at 39 FLOP per byte where they meet.');
+    tl.show([memRoof, memL], 0.5); tl.show([compRoof, compL], 0.5, { at: '<+0.3' }); tl.show(ridgeL, 0.3);
+    tl.wait(1.4);
+    tl.step('Kernels 1 and 2 request 0.06 and 0.4 FLOP per byte: far left. Both sit <b>above</b> the DRAM roof, because most of their repeated reads never reach DRAM: the L2 cache serves them.');
+    tl.show([dots[0], labs[0], dots[1], labs[1]], 0.3, { stagger: 0.2 });
+    tl.set(note, { text: 'K1: 1,056 B per 64 FLOPs → 0.06 FLOP/B · K2: 160 B per 64 FLOPs → 0.4 FLOP/B' });
+    tl.wait(1.8);
+    tl.step('Kernels 3 and 4: 8 and 16 FLOP per byte, and now <b>under</b> the roof. Bytes are no longer what limits them; instructions are (chapter 7).');
+    tl.show([dots[2], labs[2], dots[3], labs[3]], 0.3, { stagger: 0.2 });
+    tl.set(note, { text: 'K3: 8 KB per chunk for 65,536 FLOPs → 8 · K4: 4 KB per chunk for 65,536 FLOPs → 16' });
+    tl.wait(1.8);
+    tl.step('Kernels 5, 6, 9 and 10 all use a 128 × 128 block tile, so they all request the same 32 FLOP per byte. Their climb is <b>vertical</b>: same bytes, fewer instructions per multiply-add each time.');
+    tl.show([dots[4], labs[4], dots[5], labs[5], dots[6], labs[6], dots[7], labs[7]], 0.3, { stagger: 0.15 });
+    tl.set(note, { text: 'K5–K10: (128 + 128) × BK floats per chunk for 2 × 128² × BK FLOPs → 32 FLOP/B, whatever BK is' });
+    tl.set(note2, { text: 'intensity here is what the SMs request; the L2 cache makes DRAM see less, so no dot is truly memory-bound after kernel 3' }, '<');
+    tl.wait(1.8);
+    tl.step('cuBLAS sits at 23.25 TFLOP/s, and the compute roof at 30 is where the fp32 lanes end. Beyond that line the only road is a different instruction set: the tensor cores.');
+    tl.show([cuL, cuT], 0.4);
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 14.5 the whole ladder
+  (function () {
+    const S = MB.scene('a-ladder', { w: 900, h: 560, title: 'The whole ladder' });
+    const tl = S.tl;
+    const x0 = 310, W = 490, max = 30000;
+    const rows = [
+      { n: 'K1 naive', v: 309, reg: 0 }, { n: 'K2 coalescing', v: 1986.5, reg: 0 }, { n: 'K3 shared memory', v: 2980.3, reg: 0 },
+      { n: 'K4 1D blocktiling', v: 8474.7, reg: 1 }, { n: 'K5 2D blocktiling', v: 15971.7, reg: 1 },
+      { n: 'K6 vectorized', v: 18237.3, reg: 2 }, { n: 'K9 autotuning', v: 19721.0, reg: 2 }, { n: 'K10 warptiling', v: 21779.3, reg: 2 },
+      { n: 'cuBLAS', v: 23249.6, reg: 3 },
+    ];
+    const regs = [{ name: 'memory-starved', col: K.redfill, stroke: K.red }, { name: 'instruction-starved', col: K.goldfill, stroke: K.gold }, { name: 'the last mile', col: K.tealfill, stroke: K.teal }, { name: 'the reference', col: K.Cfill, stroke: K.C }];
+    const bands = [];
+    const rowH = 44, top = 60;
+    [[0, 3], [3, 5], [5, 8], [8, 9]].forEach(([a, b], i) => {
+      bands.push(S.rect({ x: 40, y: top + a * rowH - 8, w: 820, h: (b - a) * rowH, fill: regs[i].col, stroke: 'none', rx: 6, opacity: 0 }));
+    });
+    const bandL = regs.map((r, i) => S.text({ x: 52, y: top + [0, 3, 5, 8][i] * rowH + 4, text: r.name, size: 10.5, fill: r.stroke, weight: 600, opacity: 0 }));
+    const bars = rows.map((r, i) => S.bar({ x: x0, y: top + i * rowH, w: 0, h: 20, fill: regs[r.reg].col, stroke: regs[r.reg].stroke, label: r.n, value: 0, opacity: 0 }));
+    const pcts = rows.map((r, i) => S.text({ x: 860, y: top + i * rowH + 10, text: '', anchor: 'end', size: 11.5, fill: K.accent, weight: 600 }));
+    const peak = S.line({ x1: x0 + W, y1: top - 14, x2: x0 + W, y2: top + 9 * rowH - 10, stroke: K.grey, sw: 1, dash: '4 3' });
+    S.text({ x: x0 + W, y: top - 22, text: 'hardware peak 30,000', anchor: 'middle', size: 10.5, fill: K.grey });
+    const fin = S.text({ x: 40, y: 500, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const fin2 = S.text({ x: 40, y: 522, text: '', size: 12, fill: K.muted });
+    function grow(i, dur, at) { const r = rows[i]; tl.show(bars[i], 0.15, { at }); bars[i].grow(tl, W * r.v / max, r.v, dur, { at: '<' }); tl.set(pcts[i], { text: (100 * r.v / 23249.6).toFixed(1) + '%' }, '<'); }
+
+    tl.step('<b>Memory-starved.</b> Kernels 1 to 3 are about bytes: the shape of a request, then not asking twice. 309 → 2,980 GFLOP/s, and the memory system stops being the limit.');
+    tl.show([bands[0], bandL[0]], 0.3);
+    for (let i = 0; i < 3; i++) grow(i, 0.6, i === 0 ? '>' : '<+0.35');
+    tl.wait(1.8);
+    tl.step('<b>Instruction-starved.</b> Kernels 4 and 5 are about getting more multiply-adds out of every load: the column, then the outer product. 2,980 → 15,972, the biggest step on the ladder.');
+    tl.show([bands[1], bandL[1]], 0.3);
+    for (let i = 3; i < 5; i++) grow(i, 0.7, i === 3 ? '>' : '<+0.35');
+    tl.wait(1.8);
+    tl.step('<b>The last mile.</b> Kernels 6, 9 and 10 fit the instruction stream to the machine: wide loads, a searched chunk width, warp-shaped tiles. 15,972 → 21,779.');
+    tl.show([bands[2], bandL[2]], 0.3);
+    for (let i = 5; i < 8; i++) grow(i, 0.6, i === 5 ? '>' : '<+0.35');
+    tl.wait(1.8);
+    tl.step('<b>The reference.</b> cuBLAS at 23,250: many kernels, split-K, double buffering. And the peak at 30,000 that nobody reaches with fp32 lanes.');
+    tl.show([bands[3], bandL[3]], 0.3);
+    grow(8, 0.7);
+    tl.set(fin, { text: '309 → 21,779 GFLOP/s: a 70× climb, in the same 137 GFLOP of arithmetic' });
+    tl.set(fin2, { text: 'what changed, every time: how many bytes had to move to feed it, and how many instructions were spent moving them' }, '<');
+    tl.wait(3.6);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

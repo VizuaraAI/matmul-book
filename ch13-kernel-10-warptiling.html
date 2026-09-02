@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel 10: warptiling · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 13 · <em>The last mile</em></div>
+<h1>Kernel 10: warptiling</h1>
+<p class="lede">Block tile, warp tile, thread tile. The warp was always the unit that runs; kernel 10 makes it a unit of the tiling too, and the last ten percent follows.</p>
+<div class="byline">Kernel · <em>sgemmWarptiling</em> · 21,779 GFLOP/s · 93.7% of cuBLAS · measured by Simon Boehm on an NVIDIA A6000</div>
+
+<p>Until now the tiling has had two levels. The block tile maps to an SM: a block owns a 128 × 128 patch of C and stages chunks of A and B for it in shared memory. The thread tile maps to a thread's registers: each thread owns an 8 × 8 patch of the block's and accumulates it there. But chapter 3 established that the hardware has a third level in between. The warp, the group of 32 threads that a single scheduler issues instructions for, is the real unit of execution, and nothing in kernels 3 to 9 acknowledges it. Which thread sits in which warp is an accident of numbering.</p>
+
+<p>Kernel 10 makes the warp an explicit level of the hierarchy. Each warp owns a fixed patch of the block's tile, and each thread's outputs are laid out so that the 32 threads of a warp, taken together, touch a compact, predictable region of shared memory at every step. The arithmetic is unchanged. What changes is who computes what, and therefore which values sit next to which in shared memory and in the register file.</p>
+
+<h2><span class="no">13.1</span>Three levels, all visible at once</h2>
+
+<p>Here are Boehm's settings for the A6000. The block tile is still 128 × 128 with a chunk width of 16. The block has 128 threads, which is four warps, and each warp owns a 64 × 64 warp tile, so the four warps sit in a 2 × 2 arrangement over the block tile. Inside a warp tile, the layout has one more wrinkle. The warp tile is split into four <em>subtiles</em> of 64 × 16, side by side, and each thread owns an 8 × 4 patch in <em>every</em> subtile. So a thread's 128 outputs are four separate 8 × 4 patches, sixteen columns apart.</p>
+
+<figure class="wide">
+  <div id="a-levels"></div>
+  <figcaption><b>Figure 13.1.</b> The three levels of kernel 10. A block of four warps owns a 128 × 128 tile; each warp owns 64 × 64 of it; inside a warp tile, each of the 32 threads owns an 8 × 4 patch in each of four subtiles. One thread's 128 outputs are highlighted.</figcaption>
+</figure>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Block tile · threads</div><div class="v">128²<small>· 128</small></div><div class="d">4 warps in a 2 × 2 arrangement</div></div>
+  <div class="cell"><div class="l">Warp tile</div><div class="v">64 × 64</div><div class="d">4 subtiles of 64 × 16</div></div>
+  <div class="cell"><div class="l">Thread tile</div><div class="v">8 × 4<small>× 4</small></div><div class="d">128 outputs per thread, in four patches</div></div>
+  <div class="cell good"><div class="l">Loads per FMA</div><div class="v">0.1875</div><div class="d">24 loads for 128 FMAs per step</div></div>
+</div>
+
+<h2><span class="no">13.2</span>One step of k, for one warp</h2>
+
+<p>The inner loop is kernel 5's outer product, one level up. For each step of k a thread stages its A operands, eight of them (its eight rows), and its B operands, sixteen of them (four columns in each of the four subtiles), and then does 8 × 16 = 128 multiply-adds from registers. Twenty-four loads for a hundred and twenty-eight FMAs: 0.1875 loads per multiply-add, down from 0.25. Each staged A value is used sixteen times now instead of eight, and each B value eight times as before.</p>
+
+<pre><code><span class="k">for</span> (<span class="k">uint</span> dotIdx = <span class="n">0</span>; dotIdx &lt; BK; ++dotIdx) {
+  <span class="c">// stage this thread's 8 A operands: its 8 rows of the warp's 64, at column dotIdx of the transposed As</span>
+  <span class="k">for</span> (<span class="k">uint</span> i = <span class="n">0</span>; i &lt; TM; ++i)
+    regM[i] = As[dotIdx * BM + warpRow * WM + threadRowInWarp * TM + i];
+  <span class="c">// stage its 16 B operands: 4 columns in each of the 4 subtiles</span>
+  <span class="k">for</span> (<span class="k">uint</span> sub = <span class="n">0</span>; sub &lt; WNITER; ++sub)
+    <span class="k">for</span> (<span class="k">uint</span> i = <span class="n">0</span>; i &lt; TN; ++i)
+      regN[sub * TN + i] = Bs[dotIdx * BN + warpCol * WN + sub * WSUBN + threadColInWarp * TN + i];
+  <span class="c">// 8 × 16 = 128 multiply-adds, no memory touched</span>
+  <span class="k">for</span> (<span class="k">uint</span> sub = <span class="n">0</span>; sub &lt; WNITER; ++sub)
+    <span class="k">for</span> (<span class="k">uint</span> m = <span class="n">0</span>; m &lt; TM; ++m)
+      <span class="k">for</span> (<span class="k">uint</span> n = <span class="n">0</span>; n &lt; TN; ++n)
+        threadResults[m * (WNITER * TN) + sub * TN + n] += regM[m] * regN[sub * TN + n];
+}</code></pre>
+
+<p>Now look at the same step from the warp's point of view, which is the point of the kernel. The 32 threads of a warp are arranged 8 × 4 inside a subtile: eight thread-rows of four. The four threads in a thread-row want the <em>same</em> eight A values, so those loads are broadcasts, and the eight thread-rows between them want the warp's 64 consecutive floats of the transposed As: one contiguous 256-byte run. On the B side, for each subtile the four thread-columns want four adjacent groups of four floats: one contiguous 64-byte run, wanted by eight threads each. So at every step, the whole warp's shared-memory appetite is a handful of short contiguous runs, and the banks serve them without collisions.</p>
+
+<figure class="wide">
+  <div id="a-warpstep"></div>
+  <figcaption><b>Figure 13.2.</b> One step of k for one warp of kernel 10. Thread 5's 24 operands and 128 outputs are highlighted, then the whole warp's: 64 consecutive floats of As and four runs of 16 floats of Bs, each value staged once and reused by several threads.</figcaption>
+</figure>
+
+<h2><span class="no">13.3</span>Why relabelling who computes what buys ten percent</h2>
+
+<p>Nothing about the arithmetic changed, so the gain has to come from the supply side, and it comes from three places, all of them consequences of the warp being the real unit of execution. The first is the ratio above: 0.1875 loads per FMA, a quarter fewer shared-memory instructions than kernel 9 for the same arithmetic. The second is that each warp's reads are compact and predictable, so its 32 lanes hit the banks in clean runs instead of colliding, which is the thing kernels 7 and 8 tried to buy with padding and index tricks, delivered here by layout alone. The third is that each warp's work is independent of the other three warps', so the four schedulers on the SM each have a warp with a long, conflict-free run of instructions to issue.</p>
+
+<figure class="wide">
+  <div id="a-ledger10"></div>
+  <figcaption><b>Figure 13.3.</b> Kernel 9 against kernel 10. The thread holds twice as many accumulators, the block has half as many threads, and the shared-memory instruction count per multiply-add falls by a quarter. Measured: 19,721 → 21,779 GFLOP/s.</figcaption>
+</figure>
+
+<p>The price is the one chapter 10 would predict. A thread now holds 128 accumulators plus 24 operands, so it needs at least 152 registers, and the block has only 128 threads to spread the cooperative load over. Both are fine here because the kernel is now so far into the instruction-bound regime that instruction-level parallelism is doing the latency hiding, and 128 independent multiply-adds per step is a great deal of it.</p>
+
+<h2><span class="no">13.4</span>The last mile, in one view</h2>
+
+<p>Stepping back over the four kernels since the outer product: kernel 6 shaved load instructions with 128-bit loads and a transposed tile; kernel 9 found a wider chunk by search; kernel 10 aligned the tiling with the warp. Each is worth a few percent, and together they take 68.7% to 93.7%. None of them changed a byte of the traffic budget that the first five kernels fought over. That is what "the last mile" means here: the supply chain is solved, and what remains is fitting the instruction stream to the machine.</p>
+
+<figure class="wide">
+  <div id="a-lastmile"></div>
+  <figcaption><b>Figure 13.4.</b> From kernel 5 to cuBLAS, each step with its mechanism. Six percent remain, and they are not one trick; the next chapter is about them.</figcaption>
+</figure>
+
+<div class="pager"></div>
+<div class="colophon">Kernel 10's parameters are Boehm's A6000 settings (NUM_THREADS 128, BM = BN = 128, BK = 16, WM = WN = 64, WNITER = 4, TM = 8, TN = 4; hence WMITER = 1, WSUBM = 64, WSUBN = 16) and the index arithmetic in the animations follows his <code>processFromSmem</code>; the 19,721 → 21,779 GFLOP/s measurement and the three reasons are from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 13.1 three levels
+  (function () {
+    const S = MB.scene('a-levels', { w: 900, h: 520, title: 'Block tile, warp tile, thread tile in kernel 10' });
+    const tl = S.tl;
+    const bx = 40, by = 60, bs = 3; // 128 px tile at 3px per... use 3.0 px per output → 384 px
+    // block tile outline
+    const tileW = 128 * bs;
+    S.text({ x: bx + tileW / 2, y: by - 14, text: 'block tile: 128 × 128 outputs of C', anchor: 'middle', size: 12.5, fill: K.ink, weight: 600 });
+    const block = S.rect({ x: bx, y: by, w: tileW, h: tileW, fill: '#fdf6ee', stroke: K.C, sw: 1.2, rx: 2 });
+    // warp tiles 2x2
+    const warps = [];
+    for (let r = 0; r < 2; r++) for (let c = 0; c < 2; c++) warps.push(S.rect({ x: bx + c * 64 * bs, y: by + r * 64 * bs, w: 64 * bs, h: 64 * bs, fill: 'none', stroke: K.purple, sw: 1.5, rx: 1, opacity: 0 }));
+    const warpLbls = [];
+    for (let r = 0; r < 2; r++) for (let c = 0; c < 2; c++) warpLbls.push(S.text({ x: bx + c * 64 * bs + 6, y: by + r * 64 * bs + 12, text: 'warp ' + (r * 2 + c), size: 10.5, fill: K.purple, weight: 600, opacity: 0 }));
+    // subtiles of warp 0
+    const subs = [];
+    for (let s = 0; s < 4; s++) subs.push(S.rect({ x: bx + s * 16 * bs, y: by, w: 16 * bs, h: 64 * bs, fill: 'none', stroke: K.B, sw: 1, dash: '3 2', opacity: 0 }));
+    const subLbl = S.text({ x: bx, y: by + 128 * bs + 16, text: 'warp 0: four subtiles of 64 × 16 (dashed)', size: 10.5, fill: K.B, weight: 600, opacity: 0 });
+    // thread grid inside subtile 0: 8 rows x 4 cols of 8x4 patches
+    const patches = [];
+    for (let tr = 0; tr < 8; tr++) for (let tc = 0; tc < 4; tc++) patches.push(S.rect({ x: bx + tc * 4 * bs, y: by + tr * 8 * bs, w: 4 * bs, h: 8 * bs, fill: '#fff', stroke: '#c9c4bb', sw: 0.6, opacity: 0 }));
+    // thread 5's four patches (row 1, col 1) in each subtile
+    const t = 5, tr = Math.floor(t / 4), tc = t % 4;
+    const mine = [];
+    for (let s = 0; s < 4; s++) mine.push(S.rect({ x: bx + s * 16 * bs + tc * 4 * bs, y: by + tr * 8 * bs, w: 4 * bs, h: 8 * bs, fill: K.Cfill, stroke: K.C, sw: 1.4, opacity: 0 }));
+    // right-hand counters
+    const cx = 520;
+    const c1 = S.counter({ x: cx, y: 70, label: 'warps per block', value: 0, size: 24 });
+    const c2 = S.counter({ x: cx + 170, y: 70, label: 'threads per warp', value: 0, size: 24 });
+    const c3 = S.counter({ x: cx, y: 130, label: 'outputs per warp', value: 0, size: 24 });
+    const c4 = S.counter({ x: cx + 170, y: 130, label: 'outputs per thread', value: 0, size: 24 });
+    const n1 = S.text({ x: cx, y: 200, text: '', size: 12, fill: K.ink, weight: 600 });
+    const n2 = S.text({ x: cx, y: 220, text: '', size: 11.5, fill: K.muted });
+    const n3 = S.text({ x: cx, y: 240, text: '', size: 11.5, fill: K.muted });
+    const n4 = S.text({ x: cx, y: 280, text: '', size: 12, fill: K.ink, weight: 600 });
+    const n5 = S.text({ x: cx, y: 300, text: '', size: 11.5, fill: K.muted });
+    const n6 = S.text({ x: cx, y: 320, text: '', size: 11.5, fill: K.muted });
+    const n7 = S.text({ x: cx, y: 360, text: '', size: 12, fill: K.accent, weight: 600 });
+    const n8 = S.text({ x: cx, y: 380, text: '', size: 11.5, fill: K.muted });
+
+    tl.step('The block tile is unchanged: <b>128 × 128</b> outputs of C, one block. But the block now has 128 threads, which is four warps, and each warp gets a fixed quarter.');
+    tl.to(c1.num, { value: 4 }, 0.5); tl.to(c2.num, { value: 32 }, 0.5, { at: '<' });
+    tl.show(warps, 0.3, { stagger: 0.15 }); tl.show(warpLbls, 0.3, { at: '<', stagger: 0.15 });
+    tl.to(c3.num, { value: 4096 }, 0.6);
+    tl.set(n1, { text: 'warp tile: 64 × 64 = 4,096 outputs' }); tl.set(n2, { text: 'warps in a 2 × 2 arrangement (BM/WM × BN/WN)' }, '<'); tl.set(n3, { text: 'each warp’s work is independent of the other three' }, '<');
+    tl.wait(1.8);
+    tl.step('Inside warp 0’s tile: four <b>subtiles</b> of 64 × 16, side by side. The warp’s 32 threads are arranged 8 × 4 inside a subtile, each owning an 8 × 4 patch of it.');
+    tl.show(subs, 0.3, { stagger: 0.1 }); tl.show(subLbl, 0.3, { at: '<' });
+    tl.show(patches, 0.2, { stagger: 0.01 });
+    tl.set(n4, { text: 'subtile 64 × 16 = 8 × 4 threads, each an 8 × 4 patch' });
+    tl.set(n5, { text: 'thread t: row = t / 4 (0–7), column = t % 4 (0–3)' }, '<');
+    tl.wait(1.8);
+    tl.step('And every thread owns its patch in <b>all four</b> subtiles. Thread 5 (row 1, column 1) owns four 8 × 4 patches, sixteen columns apart: <b>128 outputs</b>, in four pieces.');
+    tl.show(mine, 0.3, { stagger: 0.15 });
+    tl.to(c4.num, { value: 128 }, 0.6);
+    tl.set(n6, { text: 'thread 5: rows 8–15; columns 4–7, 20–23, 36–39, 52–55' });
+    tl.wait(1.8);
+    tl.step('So the hierarchy has three levels now: block → SM, warp → scheduler, thread → registers. The arithmetic is exactly kernel 5’s outer product; what changed is who computes what.');
+    tl.set(n7, { text: 'BM = BN = 128 · BK = 16 · WM = WN = 64 · WNITER = 4' });
+    tl.set(n8, { text: 'TM = 8 · TN = 4 · 128 threads · per step: 8 A + 16 B operands, 128 FMAs' }, '<');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 13.2 one step of k for one warp
+  (function () {
+    const S = MB.scene('a-warpstep', { w: 900, h: 540, title: 'One step of k for one warp of kernel 10' });
+    const tl = S.tl;
+    const cw = 5, gx = 200, gy = 90;
+    // warp tile 64x64 at 5px = 320
+    S.text({ x: gx + 160, y: gy - 32, text: 'warp 0’s tile: 64 × 64 outputs', anchor: 'middle', size: 12.5, fill: K.ink, weight: 600 });
+    const tile = S.rect({ x: gx, y: gy, w: 64 * cw, h: 64 * cw, fill: '#fdf8f2', stroke: K.C, sw: 1, rx: 2 });
+    for (let s = 1; s < 4; s++) S.line({ x1: gx + s * 16 * cw, y1: gy, x2: gx + s * 16 * cw, y2: gy + 64 * cw, stroke: K.B, sw: 0.8, dash: '3 2' });
+    // As slice: 64 values (a column of the warp's rows) drawn vertically at left; Bs slice: 64 values drawn horizontally on top
+    const Acol = S.matrix({ x: gx - 40, y: gy, rows: 64, cols: 1, cell: cw, stroke: '#c9c4bb', sw: 0.4, label: 'As', labelSize: 11, labelPos: 'top' });
+    const Brow = S.matrix({ x: gx, y: gy - 24, rows: 1, cols: 64, cell: cw, stroke: '#c9c4bb', sw: 0.4, label: 'Bs', labelSize: 11, labelPos: 'left' });
+    const t = 5, tr = 1, tc = 1;
+    const mineA = Acol.block(tr * 8, 0, 8, 1);
+    const mineB = [0, 1, 2, 3].flatMap(s => Brow.block(0, s * 16 + tc * 4, 1, 4));
+    const mineC = [];
+    for (let s = 0; s < 4; s++) mineC.push(S.rect({ x: gx + (s * 16 + tc * 4) * cw, y: gy + tr * 8 * cw, w: 4 * cw, h: 8 * cw, fill: K.Cfill, stroke: K.C, sw: 1.2, opacity: 0 }));
+    const rowBands = [], colBands = [];
+    for (let r = 0; r < 8; r++) rowBands.push(S.rect({ x: gx, y: gy + r * 8 * cw, w: 64 * cw, h: 8 * cw, fill: K.Afill, stroke: 'none', opacity: 0 }));
+    for (let s = 0; s < 4; s++) for (let c = 0; c < 4; c++) colBands.push(S.rect({ x: gx + (s * 16 + c * 4) * cw, y: gy, w: 4 * cw, h: 64 * cw, fill: K.Bfill, stroke: 'none', opacity: 0 }));
+    const cx = 560;
+    const l1 = S.counter({ x: cx, y: 90, label: 'thread 5: A operands staged', value: 0, size: 22 });
+    const l2 = S.counter({ x: cx, y: 150, label: 'thread 5: B operands staged', value: 0, size: 22 });
+    const l3 = S.counter({ x: cx, y: 210, label: 'thread 5: multiply-adds', value: 0, size: 22 });
+    const l4 = S.counter({ x: cx, y: 270, label: 'loads per FMA', value: 0, size: 22, fill: K.green, format: v => v.toFixed(4) });
+    const w1 = S.text({ x: cx, y: 340, text: '', size: 12, fill: K.ink, weight: 600 });
+    const w2 = S.text({ x: cx, y: 360, text: '', size: 11.5, fill: K.muted });
+    const w3 = S.text({ x: cx, y: 380, text: '', size: 11.5, fill: K.muted });
+    const w4 = S.text({ x: cx, y: 400, text: '', size: 11.5, fill: K.muted });
+    const w5 = S.text({ x: cx, y: 440, text: '', size: 12, fill: K.accent, weight: 600 });
+    const w6 = S.text({ x: cx, y: 460, text: '', size: 11.5, fill: K.muted });
+    const sub0 = S.text({ x: gx, y: gy + 64 * cw + 16, text: 'subtile 0            subtile 1            subtile 2            subtile 3', size: 10.5, fill: K.B });
+
+    tl.step('Step k: thread 5 stages its <b>eight A operands</b>, the transposed As entries for its eight rows (8 … 15) at column k. Two 128-bit loads.');
+    tl.to(mineA, { fill: K.Afill, stroke: K.A, sw: 0.8 }, 0.2, { stagger: 0.05 });
+    tl.to(l1.num, { value: 8 }, 0.5);
+    tl.wait(1.4);
+    tl.step('Then its <b>sixteen B operands</b>: four adjacent columns in each of the four subtiles, sixteen columns apart. Four 128-bit loads.');
+    tl.to(mineB, { fill: K.Bfill, stroke: K.B, sw: 0.8 }, 0.15, { stagger: 0.03 });
+    tl.to(l2.num, { value: 16 }, 0.5);
+    tl.wait(1.4);
+    tl.step('Then <b>128 multiply-adds</b>, all from registers: each of the 8 A values against each of the 16 B values, into the thread’s four 8 × 4 patches. Twenty-four loads for 128 FMAs.');
+    tl.show(mineC, 0.25, { stagger: 0.1 });
+    tl.to(l3.num, { value: 128 }, 1.0, { ease: 'linear' });
+    tl.to(l4.num, { value: 24 / 128 }, 0.5);
+    tl.wait(1.6);
+    tl.step('Now the whole warp. Its eight thread-rows between them want the warp’s <b>64 consecutive floats</b> of As, and the four threads in a row want the same eight — broadcasts. One contiguous 256-byte run.');
+    tl.to(Acol.all(), { fill: K.Afill, stroke: K.A, sw: 0.8 }, 0.15, { stagger: 0.008 });
+    tl.show(rowBands, 0.2, { stagger: 0.06 });
+    tl.set(w1, { text: 'the warp’s A appetite per step' });
+    tl.set(w2, { text: '8 thread-rows × 8 floats = 64 consecutive floats' }, '<');
+    tl.set(w3, { text: 'each 8-float group read by 4 threads: broadcast' }, '<');
+    tl.wait(1.8);
+    tl.step('On the B side, for each subtile the four thread-columns want <b>four adjacent groups of four</b>: one 64-byte run per subtile, each group read by eight threads. Compact, predictable, conflict-free.');
+    tl.to(Brow.all(), { fill: K.Bfill, stroke: K.B, sw: 0.8 }, 0.15, { stagger: 0.008 });
+    tl.hide(rowBands, 0.3, { at: '<' });
+    tl.show(colBands, 0.15, { at: '<', stagger: 0.03 });
+    tl.set(w4, { text: 'B: 4 runs of 16 floats; each 4-float group read by 8 threads' });
+    tl.wait(1.8);
+    tl.step('Every staged A value is used 16 times, every B value 8 times, and the 32 lanes read a handful of short contiguous runs. That is what "warptiling" buys: the same outer product, arranged for the unit that actually runs.');
+    tl.hide(colBands, 0.3);
+    tl.set(w5, { text: 'per thread: 24 loads, 128 FMAs = 0.1875 (kernel 9: 0.25)' });
+    tl.set(w6, { text: 'per warp per step: 64 + 64 floats staged, 4,096 FMAs' }, '<');
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 13.3 ledger
+  (function () {
+    const S = MB.scene('a-ledger10', { w: 900, h: 460, title: 'Kernel 9 against kernel 10' });
+    const tl = S.tl;
+    const x0 = 300, W = 225;
+    const rows = [
+      { y: 50, name: 'outputs per thread', a: 64, b: 128, max: 128, fmt: v => MB.fmt(v) },
+      { y: 110, name: 'threads per block', a: 256, b: 128, max: 256, fmt: v => MB.fmt(v) },
+      { y: 170, name: 'registers per thread, at least', a: 80, b: 152, max: 160, fmt: v => MB.fmt(v) },
+      { y: 230, name: 'shared memory per chunk (KB)', a: 16, b: 16, max: 16, fmt: v => MB.fmt(v) + ' KB' },
+      { y: 290, name: 'loads per FMA', a: 0.25, b: 0.1875, max: 0.25, fmt: v => v.toFixed(4) },
+      { y: 350, name: 'GFLOP/s', a: 19721, b: 21779, max: 22000, fmt: v => MB.fmt(v) },
+    ];
+    S.text({ x: x0, y: 30, text: 'kernel 9', size: 12, fill: K.grey, weight: 600 });
+    S.text({ x: x0 + W + 60, y: 30, text: 'kernel 10', size: 12, fill: K.teal, weight: 600 });
+    const bars = rows.map(r => {
+      S.text({ x: x0 - 12, y: r.y + 10, text: r.name, anchor: 'end', size: 12, fill: K.ink, weight: 600 });
+      const a = S.bar({ x: x0, y: r.y, w: 0, h: 18, fill: K.greyfill, stroke: K.grey, value: 0, format: r.fmt });
+      const b = S.bar({ x: x0 + W + 60, y: r.y, w: 0, h: 18, fill: K.tealfill, stroke: K.teal, value: 0, format: r.fmt });
+      return { a, b, r };
+    });
+    const note = S.text({ x: 40, y: 420, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 440, text: '', size: 11.5, fill: K.muted });
+    tl.step('The thread tile doubles in effect: 128 outputs per thread instead of 64, and the block has half as many threads. Registers per thread rise from at least 80 to at least 152.');
+    bars.slice(0, 3).forEach(({ a, b, r }, i) => { a.grow(tl, W * r.a / r.max, r.a, 0.6, { at: i === 0 ? '>' : '<+0.1' }); b.grow(tl, W * r.b / r.max, r.b, 0.6, { at: '<' }); });
+    tl.wait(1.6);
+    tl.step('Shared memory per chunk is the same 16 KB (BK = 16 in both). Loads per multiply-add fall from 0.25 to 0.1875, a quarter fewer shared-memory instructions for identical arithmetic.');
+    bars.slice(3, 5).forEach(({ a, b, r }, i) => { a.grow(tl, W * r.a / r.max, r.a, 0.6, { at: i === 0 ? '>' : '<+0.1' }); b.grow(tl, W * r.b / r.max, r.b, 0.6, { at: '<' }); });
+    tl.wait(1.6);
+    tl.step('Measured: <b>19,721 → 21,779 GFLOP/s</b>, 84.8% → 93.7% of cuBLAS. Fewer load instructions, conflict-free warp-shaped reads, and four independent warps for four schedulers.');
+    { const { a, b, r } = bars[5]; a.grow(tl, W * r.a / r.max, r.a, 0.8); b.grow(tl, W * r.b / r.max, r.b, 0.8, { at: '<' }); }
+    tl.set(note, { text: 'the cost is chapter 10’s: 152+ registers per thread, so fewer resident warps — and 128 independent FMAs per step to hide latency with' });
+    tl.set(note2, { text: 'six percent remain to cuBLAS' }, '<');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 13.4 the last mile
+  (function () {
+    const S = MB.scene('a-lastmile', { w: 900, h: 400, title: 'From kernel 5 to cuBLAS' });
+    const tl = S.tl;
+    const x0 = 250, W = 560, max = 26500;
+    const rows = [
+      { name: 'kernel 5 · 2D blocktiling', v: 15972, mech: 'the outer product: 0.25 loads per FMA', fill: K.Afill, stroke: K.A },
+      { name: 'kernel 6 · vectorized', v: 18237, mech: '128-bit loads, transposed As: 4 load instructions per step instead of 16', fill: K.Afill, stroke: K.A },
+      { name: 'kernel 9 · autotuned', v: 19721, mech: 'BK 8 → 16 by search: half the barriers per output', fill: K.Afill, stroke: K.A },
+      { name: 'kernel 10 · warptiling', v: 21779, mech: 'warp tiles: 0.1875 loads per FMA, conflict-free warp-shaped reads', fill: K.Afill, stroke: K.A },
+      { name: 'cuBLAS', v: 23250, mech: 'many kernels, prefetching, split-K — chapter 14', fill: K.Cfill, stroke: K.C },
+    ];
+    const bars = rows.map((r, i) => {
+      const b = S.bar({ x: x0, y: 50 + i * 56, w: 0, h: 20, fill: r.fill, stroke: r.stroke, label: r.name, value: 0, opacity: 0 });
+      const m = S.text({ x: x0, y: 50 + i * 56 + 34, text: '', size: 11, fill: K.muted });
+      const p = S.text({ x: 860, y: 50 + i * 56 + 10, text: '', anchor: 'end', size: 11.5, fill: K.accent, weight: 600 });
+      return { b, m, p, r };
+    });
+    const pct = v => (100 * v / 23249.6).toFixed(1) + '%';
+    tl.step('Kernel 5 reached 68.7% with the outer product. Everything after it is the last mile: the traffic problem is solved, and the gains come from fitting the instruction stream to the machine.');
+    { const { b, m, p, r } = bars[0]; tl.show(b, 0.2); b.grow(tl, W * r.v / max, r.v, 0.7); tl.set(m, { text: r.mech }); tl.set(p, { text: pct(r.v) }, '<'); }
+    tl.wait(1.6);
+    tl.step('Kernel 6: fewer load instructions for the same bytes. Kernel 9: a wider chunk, found by measuring. Kernel 10: the tiling aligned with the warp.');
+    bars.slice(1, 4).forEach(({ b, m, p, r }, i) => { tl.show(b, 0.2, { at: i === 0 ? '>' : '<+0.5' }); b.grow(tl, W * r.v / max, r.v, 0.7, { at: '<' }); tl.set(m, { text: r.mech }, '<'); tl.set(p, { text: pct(r.v) }, '<'); });
+    tl.wait(2.0);
+    tl.step('93.7% of cuBLAS, from a kernel that is still a single file. The remaining six percent are not one trick, and even cuBLAS stops at 78% of the chip. That is the last chapter.');
+    { const { b, m, p, r } = bars[4]; tl.show(b, 0.2); b.grow(tl, W * r.v / max, r.v, 0.8); tl.set(m, { text: r.mech }); tl.set(p, { text: pct(r.v) }, '<'); }
+    tl.wait(3.0);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

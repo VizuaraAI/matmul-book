@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel 9: autotuning · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 12 · <em>The last mile</em></div>
+<h1>Kernel 9: autotuning (and the bank conflicts of kernels 7 and 8)</h1>
+<p class="lede">Five tile parameters, a few hundred legal shapes, one winner per chip. First, though, a detour through the two kernels Boehm wrote and threw away, because what they taught is worth more than what they cost.</p>
+<div class="byline">Kernel · <em>sgemmAutotuned</em> · 19,721 GFLOP/s · 84.8% of cuBLAS · measured by Simon Boehm on an NVIDIA A6000</div>
+
+<p>Between kernel 6 and the autotuned kernel 9 there are two kernels Boehm skips in his own write-up. He wrote them while working out how to remove shared-memory <em>bank conflicts</em> from the vectorized kernel, they did remove the conflicts, and they were slower overall. I'm not going to skip them entirely, for two reasons. Bank conflicts are the last piece of shared-memory mechanics this book hasn't shown, and the lesson of kernels 7 and 8 is one of the most useful in the whole worklog: removing a stall is not the same as making a kernel faster, if the stall you removed wasn't the one that was binding.</p>
+
+<h2><span class="no">12.1</span>What a bank conflict is</h2>
+
+<p>Chapter 7 drew shared memory as 32 banks, each able to hand out one 4-byte word per cycle, with consecutive words in consecutive banks: word w lives in bank w mod 32. A warp's load is served in one cycle when its 32 addresses land in 32 different banks, or when several threads want the same word (that is a broadcast, and it is free). The bad case is the third one: two or more threads wanting <em>different</em> words that live in the <em>same</em> bank. The bank can only produce one word per cycle, so the requests queue. An n-way conflict takes n cycles instead of one.</p>
+
+<p>The classic way to get one is to read down a column of a row-major tile whose row length is a multiple of 32. Thread t reads word 32t: every address is a multiple of 32, so every one of them is in bank 0, and a single load instruction takes 32 cycles. The classic fix is just as blunt: make the rows 33 words long instead of 32. Now thread t reads word 33t, which lands in bank t, and the same load takes one cycle. That padding trick is exactly what Boehm's kernel 8 does; its name in his repository is <code>sgemmResolveBankExtraCol</code>.</p>
+
+<figure class="wide">
+  <div id="a-conflict"></div>
+  <figcaption><b>Figure 12.1.</b> Three warp loads against the 32 banks. Consecutive words: one cycle. A column of a 32-wide tile: every word in bank 0, thirty-two cycles. The same column of a 33-wide tile: one cycle again. Padding costs one word per row and buys back the whole stall.</figcaption>
+</figure>
+
+<p>Kernel 6's shared-memory loads have a milder version of this: the 128-bit loads of Bs that different threads of a warp issue are spaced 32 bytes apart, so some of them collide in the banks and are served in more than one pass. Kernels 7 and 8 rearranged the tiles to make those accesses conflict-free, and the profiler confirmed the conflicts were gone. The kernels were still slower. The extra index arithmetic and the less regular layout cost more instructions than the conflicts had cost cycles, and instructions were the binding resource by then. Boehm kept the diagnosis and dropped the kernels, which is the right call and a good habit: measure the whole thing, not the stall you were staring at.</p>
+
+<h2><span class="no">12.2</span>Five parameters, no theory</h2>
+
+<p>By now the kernel has five free parameters. The block tile is BM × BN. The chunk width is BK. The thread tile is TM × TN. Together they fix the number of threads per block, BM × BN ÷ (TM × TN), how much shared memory a chunk needs, how many registers each thread holds, and how many blocks can be resident on an SM. Every choice trades against the others. Bigger tiles mean more reuse but more registers and more shared memory; more threads mean better latency hiding but a smaller share of the register file each; a wider BK means fewer barriers per chunk but a bigger tile to hold.</p>
+
+<p>Nobody can reason their way to the optimum, because it depends on the specific SM's register file, its shared-memory size, its scheduler count, the L2, and the matrix shape. So Boehm stopped reasoning and started measuring: generate every legal combination, compile each one, run it, keep the winner. That is autotuning, and every high-performance library does it.</p>
+
+<h2><span class="no">12.3</span>Filter, then measure</h2>
+
+<p>Not every combination is legal, and the hardware's own rules do most of the pruning before anything is timed. The thread count has to be a multiple of 32 and at most 1,024. The two tiles of a chunk have to fit in 48 KB of shared memory. Each thread's accumulators and operands have to fit in 255 registers. And the cooperative load has to divide evenly: with 128-bit loads, each thread copies four floats at a time, so BM × BK and BN × BK must both be multiples of four times the thread count, and Boehm's kernel adds a few more divisibility conditions so that no thread ever handles a partial row. The animation applies those rules to a grid of candidates, live, and counts what survives.</p>
+
+<figure class="wide">
+  <div id="a-space"></div>
+  <figcaption><b>Figure 12.2.</b> The search space, filtered by the hardware's own rules. Each dot is one combination of BM, BN, BK, TM and TN from this page's grid; the filters are the constraints Boehm's kernel asserts at compile time. Only the survivors are worth benchmarking. His script compiled and timed about 400 of them.</figcaption>
+</figure>
+
+<p>On the A6000 the winner was BM = BN = 128, BK = 16, TM = TN = 8: the same tiles as kernel 6 with a chunk twice as wide, which means half as many barriers per output and half as many trips through the outer loop. That bought 18,237 → 19,721 GFLOP/s, about 8%. Boehm is candid that he cannot explain why this exact combination wins, and his verdict on the method is worth keeping: "Autotuning works, every high-performance library uses it, but it also feels very unsatisfying."</p>
+
+<h2><span class="no">12.4</span>The optimum belongs to the chip</h2>
+
+<p>The lesson is not "tuning gives 8%". It is what happened when he ran the same search on a different card. On an A100, the A6000's winning shape reached 12.0 TFLOP/s, and a completely different shape, BM = BN = 64, BK = 16, TM = TN = 4, reached 12.6. Smaller tiles everywhere, and 5% faster than the shape that was optimal one chip over. The optimum is a property of the specific chip, not of the algorithm.</p>
+
+<figure class="wide">
+  <div id="a-chips"></div>
+  <figcaption><b>Figure 12.3.</b> The same search on two cards. Each card has its own winning shape, and each card's winner is a few percent better than the other card's. A portable library cannot hard-code one kernel.</figcaption>
+</figure>
+
+<div class="key">
+  <div class="t">What autotuning taught</div>
+  <p>Once a kernel is close to the arithmetic limit, the last few percent depend on details no model captures, and those details differ from chip to chip. So a library that has to run well everywhere cannot ship one tuned kernel. It ships many, and picks between them at runtime. Hold that thought for cuBLAS in chapter 14.</p>
+</div>
+
+<p>There is one more structural idea left before that, and it comes from the hardware rather than from a search. The tiling so far has two levels, the block and the thread. The machine has a third level in between, the warp, and kernel 10 makes it explicit.</p>
+
+<div class="pager"></div>
+<div class="colophon">The bank model is Ampere's (32 banks, 4-byte words, one word per bank per cycle). Kernels 7 and 8, their names, and the finding that they removed conflicts yet ran slower are from Simon Boehm's repository and <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>, as are the autotuning constraints (the static assertions in his runner), the "about 400" configurations, the A6000 and A100 winners, and the quoted sentence. The candidate grid in figure 12.2 is this page's own, filtered by his rules; its survivor count is computed live and is not his.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+
+  // ------------------------------------------------------------ 12.1 bank conflicts
+  (function () {
+    const S = MB.scene('a-conflict', { w: 900, h: 470, title: 'Three warp loads against the 32 shared-memory banks' });
+    const tl = S.tl;
+    const bx = 60, by = 70, bw = 18, bgap = 6, bh = 70;
+    S.membox({ x: 40, y: 40, w: 820, h: 150, label: 'shared memory — 32 banks, one word per bank per cycle', labelPos: 'topleft', labelSize: 12, fill: K.purplefill, stroke: K.purple, rx: 10 });
+    const banks = [], slots = [];
+    for (let b = 0; b < 32; b++) {
+      const x = bx + b * (bw + bgap) + 4;
+      banks.push(S.rect({ x, y: by, w: bw, h: bh, fill: '#fff', stroke: '#c8bde3', rx: 3 }));
+      S.text({ x: x + bw / 2, y: by + bh + 10, text: '' + b, anchor: 'middle', size: 8.5, fill: K.muted });
+      const col = [];
+      for (let r = 0; r < 3; r++) col.push(S.rect({ x: x + 2, y: by + 4 + r * 22, w: bw - 4, h: 18, fill: '#f6f3fb', stroke: 'none', rx: 2 }));
+      slots.push(col);
+    }
+    const W = S.threads({ x: 64, y: 250, n: 32, size: 18, gap: 6, fill: '#5b5750' });
+    S.text({ x: 64, y: 238, text: 'one warp: 32 threads, one word each', size: 11, fill: K.muted });
+    const lines = [];
+    for (let t = 0; t < 32; t++) { const [tx0, ty0] = W.center(t); lines.push(S.line({ x1: tx0, y1: ty0 - 9, x2: tx0, y2: by + bh, stroke: K.B, sw: 1.2, opacity: 0 })); }
+    const req = S.text({ x: 64, y: 300, text: '', font: 'mono', size: 12.5, fill: K.ink });
+    const reqNote = S.text({ x: 64, y: 322, text: '', size: 12, fill: K.muted });
+    const cyc = S.counter({ x: 860, y: 296, label: 'cycles for this load', value: 0, size: 30, anchor: 'end', fill: K.ink });
+    const queue = S.text({ x: 64, y: 372, text: '', size: 12.5, fill: K.red, weight: 600 });
+    const fix = S.text({ x: 64, y: 400, text: '', size: 12.5, fill: K.green, weight: 600 });
+    const bankOf = w => w % 32;
+
+    function request(words, color, slot) {
+      lines.forEach((l, t) => tl.to(l, { x2: bx + bankOf(words[t]) * (bw + bgap) + 4 + bw / 2, opacity: 1 }, 0.35, { at: t === 0 ? '>' : '<+0.012' }));
+      const counts = {};
+      words.forEach(w => { counts[bankOf(w)] = (counts[bankOf(w)] || 0) + 1; });
+      Object.keys(counts).forEach((b, i) => tl.to(slots[b][slot], { fill: color.f, stroke: color.s, sw: 1 }, 0.2, { at: i === 0 ? '>' : '<' }));
+      return Math.max(...Object.values(counts));
+    }
+    function clear(slot) {
+      tl.hide(lines, 0.25);
+      lines.forEach((l, t) => tl.set(l, { x2: W.center(t)[0] }, '<'));
+      slots.forEach(c => tl.to(c[slot], { fill: '#f6f3fb', stroke: 'none' }, 0.25, { at: '<' }));
+      tl.set(cyc.num, { value: 0 }, '<');
+    }
+
+    tl.step('Thread t reads word t: 32 consecutive words, 32 different banks. Every bank answers at once. <b>One cycle.</b>');
+    tl.set(req, { text: 'words 0, 1, 2, … 31' }); tl.set(reqNote, { text: 'bank = word mod 32 → banks 0 … 31, one each' }, '<');
+    { const n = request(Array.from({ length: 32 }, (_, t) => t), { f: K.Bfill, s: K.B }, 0); tl.to(cyc.num, { value: n }, 0.3); }
+    tl.wait(1.6);
+
+    tl.step('Now a <b>column</b> of a row-major tile whose rows are 32 words long: thread t reads word 32t. Every address is a multiple of 32, so every one lands in <b>bank 0</b>.');
+    clear(0);
+    tl.set(req, { text: 'words 0, 32, 64, … 992   (a column of a 32-wide tile)' }); tl.set(reqNote, { text: 'bank = 32t mod 32 = 0 for every thread: a 32-way conflict' }, '<');
+    { const n = request(Array.from({ length: 32 }, (_, t) => 32 * t), { f: K.redfill, s: K.red }, 1); tl.to(cyc.num, { value: n }, 1.2, { ease: 'linear' }); tl.to(cyc.num, { fill: K.red }, 0.2, { at: '<' }); }
+    tl.set(queue, { text: 'one bank, 32 different words: it can hand out one per cycle, so the requests queue — 32 cycles for one load' });
+    tl.wait(2.0);
+
+    tl.step('The fix in kernel 8: pad each row to <b>33 words</b>. Thread t now reads word 33t, which lands in bank t. Same column, one cycle. The cost is one wasted word per row.');
+    clear(1);
+    tl.set(req, { text: 'words 0, 33, 66, … 1,023   (a column of a 33-wide tile)' }); tl.set(reqNote, { text: 'bank = 33t mod 32 = t: thirty-two different banks again' }, '<');
+    tl.set(queue, { text: '' }, '<'); tl.to(cyc.num, { fill: K.ink }, 0.2, { at: '<' });
+    { const n = request(Array.from({ length: 32 }, (_, t) => 33 * t), { f: K.Bfill, s: K.B }, 2); tl.to(cyc.num, { value: n }, 0.3); }
+    tl.set(fix, { text: 'conflict-free: sgemmResolveBankExtraCol (kernel 8) does exactly this' });
+    tl.wait(1.8);
+    tl.step('Kernels 7 and 8 removed the milder conflicts in kernel 6’s tile loads, and the profiler agreed. They were still <b>slower</b>: the extra index arithmetic cost more instructions than the conflicts had cost cycles. Measure the whole thing.');
+    tl.wait(3.4);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 12.2 the search space
+  (function () {
+    const S = MB.scene('a-space', { w: 900, h: 540, title: 'The autotuning search space, filtered by the hardware’s rules' });
+    const tl = S.tl;
+    // the grid of candidates (this page's grid)
+    const BMs = [64, 128, 256], BNs = [64, 128, 256], BKs = [8, 16, 32, 64], TMs = [4, 8, 16, 32], TNs = [4, 8, 16, 32];
+    const cands = [];
+    BMs.forEach(BM => BNs.forEach(BN => BKs.forEach(BK => TMs.forEach(TM => TNs.forEach(TN => cands.push({ BM, BN, BK, TM, TN }))))));
+    const rules = [
+      { name: 'thread count legal', test: c => { const n = c.BM * c.BN / (c.TM * c.TN); return n >= 64 && n <= 1024 && n % 32 === 0; }, why: 'BM × BN ÷ (TM × TN) must be a multiple of 32 and at most 1,024' },
+      { name: 'shared memory fits', test: c => (c.BM + c.BN) * c.BK * 4 <= 49152, why: '(BM + BN) × BK × 4 bytes ≤ 48 KB' },
+      { name: 'registers fit', test: c => c.TM * c.TN + c.TM + c.TN <= 255, why: 'TM × TN accumulators + TM + TN operands ≤ 255 per thread' },
+      { name: 'vector loads divide evenly', test: c => { const n = c.BM * c.BN / (c.TM * c.TN); return (c.BM * c.BK) % (4 * n) === 0 && (c.BN * c.BK) % (4 * n) === 0 && (n * 4) % c.BK === 0 && (n * 4) % c.BN === 0 && c.BN % (16 * c.TN) === 0 && c.BM % (16 * c.TM) === 0; }, why: 'Boehm’s static assertions: no thread handles a partial row when copying float4s' },
+    ];
+    const cols = 48, cw = 13, gx = 40, gy = 60;
+    const dots = cands.map((c, i) => S.rect({ x: gx + (i % cols) * cw, y: gy + Math.floor(i / cols) * cw, w: cw - 3, h: cw - 3, fill: '#d9d5cb', stroke: 'none', rx: 2 }));
+    const rows = Math.ceil(cands.length / cols);
+    S.text({ x: gx, y: gy - 16, text: `candidates: BM, BN ∈ {64, 128, 256} · BK ∈ {8, 16, 32, 64} · TM, TN ∈ {4, 8, 16, 32}  →  ${cands.length} combinations`, size: 11.5, fill: K.muted });
+    const cnt = S.counter({ x: 860, y: gy + rows * cw + 30, label: 'still legal', value: cands.length, size: 28, anchor: 'end' });
+    const ruleT = S.text({ x: gx, y: gy + rows * cw + 34, text: '', size: 13, fill: K.ink, weight: 600 });
+    const ruleW = S.text({ x: gx, y: gy + rows * cw + 54, text: '', size: 11.5, fill: K.muted });
+    const winner = S.text({ x: gx, y: gy + rows * cw + 90, text: '', size: 12.5, fill: K.accent, weight: 600 });
+    const winner2 = S.text({ x: gx, y: gy + rows * cw + 110, text: '', size: 11.5, fill: K.muted });
+    let alive = cands.map(() => true);
+    let n = cands.length;
+    tl.step(`Start with every combination of the five parameters on this page’s grid: <b>${cands.length}</b> candidate kernels. Most of them cannot even be compiled.`);
+    tl.wait(1.6);
+    rules.forEach(r => {
+      const killed = [];
+      cands.forEach((c, i) => { if (alive[i] && !r.test(c)) { alive[i] = false; killed.push(dots[i]); } });
+      n -= killed.length;
+      tl.step(`<b>${r.name}:</b> ${r.why}. ${killed.length} candidates fail it; ${n} remain.`);
+      tl.set(ruleT, { text: r.name }); tl.set(ruleW, { text: r.why }, '<');
+      tl.to(killed, { fill: '#f3f0e8', opacity: 0.35 }, 0.15, { stagger: Math.min(0.01, 1.2 / Math.max(1, killed.length)) });
+      tl.to(cnt.num, { value: n }, 0.8, { at: '<', ease: 'linear' });
+      tl.wait(1.6);
+    });
+    const survivors = cands.map((c, i) => i).filter(i => alive[i]);
+    const wi = cands.findIndex(c => c.BM === 128 && c.BN === 128 && c.BK === 16 && c.TM === 8 && c.TN === 8);
+    tl.step(`Compile and time every survivor, keep the winner. Boehm’s grid was larger than this page’s and his script timed about 400 survivors. On the A6000 the winner was <b>BM = BN = 128, BK = 16, TM = TN = 8</b>: 18,237 → 19,721 GFLOP/s.`);
+    tl.to(survivors.map(i => dots[i]), { fill: K.tealfill, stroke: K.teal, sw: 1 }, 0.1, { stagger: 0.006 });
+    if (wi >= 0) { tl.to(dots[wi], { fill: K.C, stroke: K.Cdeep, sw: 2 }, 0.4); tl.pulse(dots[wi].pivot(gx + (wi % cols) * cw + (cw - 3) / 2, gy + Math.floor(wi / cols) * cw + (cw - 3) / 2), 2.2, 0.8); }
+    tl.set(ruleT, { text: 'benchmark the survivors' }); tl.set(ruleW, { text: 'compile each one, run it on the real problem, keep the fastest' }, '<');
+    tl.set(winner, { text: 'A6000 winner: BM = BN = 128, BK = 16, TM = TN = 8  (256 threads)  ·  19,721 GFLOP/s, +8% over kernel 6' });
+    tl.set(winner2, { text: 'kernel 6’s shape with BK doubled: half the barriers per output' }, '<');
+    tl.wait(3.4);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 12.3 two chips
+  (function () {
+    const S = MB.scene('a-chips', { w: 900, h: 380, title: 'The same search on two cards' });
+    const tl = S.tl;
+    const x0 = 300, W = 520;
+    S.text({ x: x0, y: 40, text: 'NVIDIA A6000 — GFLOP/s', size: 13, fill: K.ink, weight: 600 });
+    const a1 = S.bar({ x: x0, y: 56, w: 0, h: 20, fill: K.greyfill, stroke: K.grey, label: 'kernel 6 (128·128·8·8·8)', value: 0 });
+    const a2 = S.bar({ x: x0, y: 84, w: 0, h: 20, fill: K.tealfill, stroke: K.teal, label: 'A6000 winner (128·128·16·8·8)', value: 0 });
+    S.text({ x: x0, y: 160, text: 'NVIDIA A100 — TFLOP/s', size: 13, fill: K.ink, weight: 600 });
+    const b1 = S.bar({ x: x0, y: 176, w: 0, h: 20, fill: K.greyfill, stroke: K.grey, label: 'the A6000’s winner, run on the A100', value: 0, format: v => v.toFixed(1) });
+    const b2 = S.bar({ x: x0, y: 204, w: 0, h: 20, fill: K.tealfill, stroke: K.teal, label: 'A100 winner (64·64·16·4·4)', value: 0, format: v => v.toFixed(1) });
+    const note = S.text({ x: 40, y: 290, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 312, text: '', size: 12, fill: K.muted });
+    const note3 = S.text({ x: 40, y: 344, text: '', size: 12.5, fill: K.accent, weight: 600 });
+    tl.step('On the A6000, kernel 6’s shape gives 18,237 GFLOP/s and the search finds a shape worth 19,721.');
+    a1.grow(tl, W * 18237 / 20000, 18237, 0.8); a2.grow(tl, W * 19721 / 20000, 19721, 0.8, { at: '<+0.3' });
+    tl.wait(1.6);
+    tl.step('Carry the A6000’s winning shape to an A100 and it reaches 12.0 TFLOP/s. Run the search there and a <b>different</b> shape wins, with smaller tiles everywhere: 12.6.');
+    b1.grow(tl, W * 12.0 / 13, 12.0, 0.8); b2.grow(tl, W * 12.6 / 13, 12.6, 0.8, { at: '<+0.3' });
+    tl.set(note, { text: 'parameters written BM · BN · BK · TM · TN' });
+    tl.set(note2, { text: 'A6000: 84 SMs, 6 MB L2, 768 GB/s · A100: a different SM count, a much larger L2, HBM — a different balance, a different optimum' }, '<');
+    tl.wait(1.8);
+    tl.step('The optimum is a property of the chip, not of the algorithm. A library that must run well everywhere cannot hard-code one kernel — which is what cuBLAS is about.');
+    tl.set(note3, { text: 'each card’s own winner beats the other card’s winner by about 5–8% — small, but only a search finds it' });
+    tl.wait(3.0);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>

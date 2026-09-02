@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Occupancy: the packing game, and why it is not the goal · How a Matmul Kernel Gets Fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<div class="frame">
+<nav class="side"></nav>
+<main>
+<article>
+
+<div class="kicker">Chapter 10 · <em>The instruction-starved kernels</em></div>
+<h1>Occupancy: the packing game, and why it is not the goal</h1>
+<p class="lede">Kernel 5 has lower occupancy than kernel 3 and runs five times faster. Threads, registers and shared memory are three budgets on every SM, and what you buy with them matters more than how full they are.</p>
+<div class="byline">Concept · <em>resident warps per SM</em> · kernel 3 at 66%, kernel 5 near 50% · why the slower kernel has the higher number</div>
+
+<p>Kernel 5 asks each thread to hold 64 running totals, plus its eight A operands, plus its eight B operands, plus its indices. Those 64 accumulators must live in registers for the whole kernel; that is the entire point of them. So the thread needs at least 64 + 8 + 8 = 80 registers, and in practice a little more. Registers are a fixed, shared resource on the SM, so this is not free. To see what it costs, we need the packing game from the first post, now played with two real kernels.</p>
+
+<h2><span class="no">10.1</span>What occupancy means</h2>
+
+<p>An SM on this GPU can host at most 1,536 threads at once, which is 48 warps. Warps that are loaded onto the SM are called <em>resident</em>, and occupancy is simply the fraction of the 48 slots that are filled. It matters for the reason chapter 3 gave: when a warp stalls waiting for memory, the scheduler switches to another resident warp that is ready. Resident warps are the raw material of latency hiding. Fewer of them, and a stall is more likely to leave a scheduler with nothing to issue.</p>
+
+<p>How many warps are resident is decided by how many blocks fit on the SM, and a block fits only if it fits three budgets at once: threads, registers, and shared memory. The SM accepts blocks until one of the three runs out, and whichever runs out first decides.</p>
+
+<h2><span class="no">10.2</span>How many blocks fit: kernel 3</h2>
+
+<p>For kernel 3 the numbers are exactly known from Boehm's profiler. Each block is 1,024 threads. The compiler assigned 37 registers per thread, which the hardware rounds up to 40 because registers are handed out to a warp in units of 256: 1,280 per warp, 40,960 per block. And the block declares 8 KB of shared memory, to which the runtime adds 1 KB of its own bookkeeping: 9,216 bytes.</p>
+
+<figure class="wide">
+  <div id="a-budgets3"></div>
+  <figcaption><b>Figure 10.1.</b> The packing game for kernel 3. Each block is a brick with three dimensions; the SM stacks bricks until one budget is full. The first block uses two thirds of the thread budget and most of the register budget, so a second block cannot fit.</figcaption>
+</figure>
+
+<div class="ledger">
+  <div class="cell"><div class="l">Threads</div><div class="v">1 <small>block</small></div><div class="d">1,536 ÷ 1,024 = 1.5</div></div>
+  <div class="cell"><div class="l">Registers</div><div class="v">1 <small>block</small></div><div class="d">65,536 ÷ 40,960 = 1.6</div></div>
+  <div class="cell"><div class="l">Shared memory</div><div class="v">11 <small>blocks</small></div><div class="d">102,400 ÷ 9,216 = 11.1</div></div>
+  <div class="cell acc"><div class="l">Occupancy</div><div class="v">66%</div><div class="d">1 block = 32 of 48 warps</div></div>
+</div>
+
+<p>The smallest wins: one block, which is 1,024 threads, which is 32 warps of the 48 available. Shared memory was never close to being the constraint; threads and registers were, together. Sixty-six percent sounds like the kind of number that explains a slow kernel. Hold that thought.</p>
+
+<h2><span class="no">10.3</span>Kernel 5 in the same game</h2>
+
+<p>Kernel 5's block is 256 threads, eight warps, and each thread wants at least 80 registers. Suppose the compiler assigns exactly 80: that is 2,560 per warp and 20,480 per block. Shared memory is 8 KB plus the 1 KB overhead again, 9,216 bytes. Play the same game.</p>
+
+<figure class="wide">
+  <div id="a-budgets5"></div>
+  <figcaption><b>Figure 10.2.</b> The packing game for kernel 5 at 80 registers per thread. Threads would allow six blocks and shared memory eleven, but the register file is full after three. Three blocks is 24 warps: 50% occupancy. If the compiler spends a few more registers per thread, two blocks fit, and it is 33%.</figcaption>
+</figure>
+
+<p>So here is the uncomfortable fact. Kernel 5 has <em>lower</em> occupancy than kernel 3, and is 5.4× faster: 15,972 against 2,980 GFLOP/s. If occupancy were the thing to maximize, that could not happen. So it is not the thing to maximize, and it is worth being precise about why.</p>
+
+<h2><span class="no">10.4</span>Two ways to hide latency</h2>
+
+<p>Latency hiding can come from two different places. The first is what chapter 3 described: many warps, so that when one stalls the scheduler switches to another. Call it <em>thread-level parallelism</em>. The second is many independent instructions inside a single warp, so that while one multiply-add is still in flight the next can already be issued, because it does not depend on the first. Call it <em>instruction-level parallelism</em>.</p>
+
+<figure class="wide">
+  <div id="a-tlp"></div>
+  <figcaption><b>Figure 10.3.</b> Two ways to keep a scheduler's lanes busy. Left, kernel 3's style: each warp has one dependent chain, so it can only issue every fourth cycle, and it takes four resident warps to fill the slots. Right, kernel 5's style: one warp with 64 independent multiply-adds fills every slot on its own.</figcaption>
+</figure>
+
+<p>Kernel 3 has essentially none of the second kind. Its inner loop has one accumulator, and each iteration must wait for the previous one, so its only defence against latency is having lots of warps. Kernel 5 has 64 accumulators, and the 64 multiply-adds in its inner loop are completely independent of one another. The scheduler can keep many of them in flight from a single warp. It buys with instruction-level parallelism what kernel 3 had to buy with warps, and it gets a much better deal, because those same registers also eliminated seven eighths of the shared-memory traffic.</p>
+
+<div class="aside">
+  <div class="t">Aside · the practical rule</div>
+  <p>Occupancy is a means, not an end. What you actually want is for the arithmetic units to never run dry, and warps are only one way to arrange that. Chasing 100% occupancy by shrinking the per-thread tile would hand back the register-level caching that made kernel 5 fast in the first place. The useful question is never "is my occupancy high?" but "is anything starving?", and chapter 7 showed how to find out.</p>
+</div>
+
+<h2><span class="no">10.5</span>Why not 16 × 16</h2>
+
+<p>This also answers the question kernel 5 left hanging. If an 8 × 8 thread tile is good, why not 16 × 16, with 256 accumulators? Because 256 accumulators alone are more than the 255 registers a thread may have at all, before counting the operands and indices, and long before that limit the register file would allow so few resident warps that nothing could hide even the shared-memory latency. Going the other way, a 4 × 4 tile needs only about 24 registers and would let the SM fill every warp slot, but it spends 0.5 loads per multiply-add, twice kernel 5's, and chapter 7 said that ratio is what binds.</p>
+
+<figure class="wide">
+  <div id="a-sweet"></div>
+  <figcaption><b>Figure 10.4.</b> The trade the thread tile makes. Bigger tiles cut loads per FMA but cost registers, and the register file is finite in two ways: 255 per thread, and 65,536 per SM shared among all resident warps. The 8 × 8 tile sits near the sweet spot.</figcaption>
+</figure>
+
+<p>The 8 × 8 tile sits near the sweet spot of that trade, and finding sweet spots like it is precisely the kind of thing an autotuner is good at, as chapter 12 will show. Before that, chapter 11 picks up the smaller gains that are left once the traffic problems are solved: it starts shaving instructions.</p>
+
+<div class="pager"></div>
+<div class="colophon">Kernel 3's occupancy inputs (1,024 threads, 37 registers rounded to 40, 8 KB + 1 KB shared memory) and the SM limits (1,536 threads, 65,536 registers, 102,400 B of shared memory, 48 warps) are from Simon Boehm's <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>. Kernel 5's 80 registers per thread is the minimum its 64 accumulators and 16 operands imply; the 50% and 33% figures are the arithmetic that follows at 80 and at 96, not a measurement.</div>
+
+</article>
+</main>
+</div>
+
+<script src="assets/anim.js"></script>
+<script src="assets/nav.js"></script>
+<script>
+(function () {
+  const K = MB.color;
+  const LIM = { threads: 1536, regs: 65536, smem: 102400 };
+
+  // shared builder for the packing game
+  function packingGame(id, title, block, tries, finalCaption) {
+    const S = MB.scene(id, { w: 900, h: 500, title });
+    const tl = S.tl;
+    const gx = [120, 400, 680], gw = 120, gy = 80, gh = 300;
+    const names = ['threads', 'registers', 'shared memory'];
+    const keys = ['threads', 'regs', 'smem'];
+    const units = ['1,536 threads = 48 warps', '65,536 registers', '102,400 B'];
+    const cols = [{ f: '#e7e4dc', s: K.grey }, { f: K.goldfill, s: K.gold }, { f: K.purplefill, s: K.purple }];
+    const gauges = keys.map((k, i) => {
+      S.rect({ x: gx[i], y: gy, w: gw, h: gh, fill: '#fbfaf7', stroke: K.rule, rx: 6 });
+      S.text({ x: gx[i] + gw / 2, y: gy - 24, text: names[i], anchor: 'middle', size: 13, fill: K.ink, weight: 600 });
+      S.text({ x: gx[i] + gw / 2, y: gy - 8, text: units[i], anchor: 'middle', size: 10.5, fill: K.muted });
+      const bricks = [];
+      const pct = S.text({ x: gx[i] + gw / 2, y: gy + gh + 16, text: '0%', anchor: 'middle', size: 12.5, fill: K.ink, weight: 600 });
+      const used = S.text({ x: gx[i] + gw / 2, y: gy + gh + 32, text: '', anchor: 'middle', size: 10.5, fill: K.muted });
+      return { i, bricks, pct, used, col: cols[i] };
+    });
+    const brickLbl = S.text({ x: 40, y: 440, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const brickLbl2 = S.text({ x: 40, y: 460, text: '', size: 12, fill: K.muted });
+    const verdict = S.text({ x: 40, y: 486, text: '', size: 12.5, fill: K.red, weight: 600 });
+    const occ = S.counter({ x: 860, y: 404, label: 'resident warps', value: 0, size: 26, anchor: 'end', format: v => Math.round(v) + ' / 48' });
+    const occP = S.counter({ x: 860, y: 448, label: 'occupancy', value: 0, size: 20, anchor: 'end', fill: K.accent, format: v => v.toFixed(0) + '%' });
+
+    tl.step('Every SM has three budgets: <b>1,536 threads</b> (48 warps), <b>65,536 registers</b>, and <b>102,400 bytes</b> of shared memory. A block is admitted only if it fits all three.');
+    tl.wait(1.8);
+    tl.step(`One block of ${block.name} needs <b>${MB.fmt(block.threads)} threads</b>, <b>${MB.fmt(block.regs)} registers</b> and <b>${MB.fmt(block.smem)} bytes</b> of shared memory: ${block.why}`);
+    tl.set(brickLbl, { text: `one block: ${MB.fmt(block.threads)} threads · ${MB.fmt(block.regs)} registers · ${MB.fmt(block.smem)} B shared memory` });
+    tl.set(brickLbl2, { text: block.detail });
+    // a floating brick preview
+    tl.wait(1.8);
+    const usedNow = { threads: 0, regs: 0, smem: 0 };
+    let nRes = 0;
+    tries.forEach((tr, n) => {
+      const fits = keys.every(k => usedNow[k] + block[k] <= LIM[k]);
+      tl.step(tr.caption);
+      if (fits) {
+        gauges.forEach((g, i) => {
+          const k = keys[i];
+          const h0 = gh * usedNow[k] / LIM[k], h1 = gh * block[k] / LIM[k];
+          const r = S.rect({ x: gx[i] + 6, y: gy + gh - h0 - h1, w: gw - 12, h: h1 - 1.5, fill: g.col.f, stroke: g.col.s, sw: 1, rx: 2, opacity: 0 });
+          r.setNow({ ty: -40 });
+          tl.to(r, { opacity: 1, ty: 0 }, 0.5, { at: i === 0 ? '>' : '<', ease: 'out' });
+          usedNow[k] += block[k];
+          tl.set(g.pct, { text: (100 * usedNow[k] / LIM[k]).toFixed(0) + '%' });
+          tl.set(g.used, { text: MB.fmt(usedNow[k]) + ' used' }, '<');
+        });
+        nRes += block.warps;
+        tl.to(occ.num, { value: nRes }, 0.4);
+        tl.to(occP.num, { value: 100 * nRes / 48 }, 0.4, { at: '<' });
+        tl.set(verdict, { text: '' }, '<');
+      } else {
+        // show the overflow: a red ghost brick above the failing gauges
+        const failing = keys.filter(k => usedNow[k] + block[k] > LIM[k]);
+        gauges.forEach((g, i) => {
+          const k = keys[i];
+          const h0 = gh * usedNow[k] / LIM[k], h1 = gh * block[k] / LIM[k];
+          const bad = failing.includes(k);
+          const r = S.rect({ x: gx[i] + 6, y: gy + gh - h0 - h1, w: gw - 12, h: h1 - 1.5, fill: bad ? K.redfill : '#fff', stroke: bad ? K.red : K.faint, sw: 1, rx: 2, opacity: 0, dash: '4 3' });
+          tl.to(r, { opacity: 1 }, 0.3, { at: i === 0 ? '>' : '<' });
+          tl.to(r, { opacity: 0 }, 0.3, { at: '<+1.6' });
+        });
+        tl.set(verdict, { text: `block ${n + 1} does not fit: ${failing.map((k, j) => `${names[keys.indexOf(k)]} would need ${MB.fmt(usedNow[k] + block[k])}`).join('; ')}` });
+      }
+      tl.wait(2.0);
+    });
+    tl.step(finalCaption);
+    tl.wait(3.2);
+    S.finish();
+  }
+
+  packingGame('a-budgets3', 'The packing game for kernel 3',
+    { name: 'kernel 3', threads: 1024, regs: 40960, smem: 9216, warps: 32, why: '1,024 threads × 40 registers (37 rounded up to the allocation unit), and 8 KB of tiles plus 1 KB of runtime overhead.', detail: '32 warps × 1,280 registers per warp = 40,960 · As + Bs = 8,192 B + 1,024 B reserved' },
+    [
+      { caption: 'Drop in the first block. Threads: 1,024 of 1,536, two thirds. Registers: 40,960 of 65,536. Shared memory: barely touched.' },
+      { caption: 'Try a second block. It would need 2,048 threads and 81,920 registers. <b>Neither fits.</b> The SM stops at one.' },
+    ],
+    'One block is resident: <b>32 warps of 48, 66% occupancy</b>. Threads and registers ran out together; shared memory would have allowed eleven blocks. Hold on to this number.');
+
+  packingGame('a-budgets5', 'The packing game for kernel 5',
+    { name: 'kernel 5', threads: 256, regs: 20480, smem: 9216, warps: 8, why: '256 threads × 80 registers (64 accumulators + 8 + 8 operands), and the same 8 KB + 1 KB of shared memory.', detail: '8 warps × 2,560 registers per warp = 20,480 · at 96 registers per thread it would be 24,576' },
+    [
+      { caption: 'First block: 256 threads is only a sixth of the thread budget, but 20,480 registers is nearly a third of the register file.' },
+      { caption: 'Second block fits easily.' },
+      { caption: 'Third block: 768 threads, <b>61,440 registers</b> — the register file is 94% full.' },
+      { caption: 'Fourth block would need 81,920 registers. <b>Registers run out</b> long before threads (1,024 of 1,536) or shared memory (36,864 of 102,400).' },
+    ],
+    'Three blocks are resident: <b>24 warps of 48, 50% occupancy</b>, decided by registers alone. At 96 registers per thread only two blocks fit: 33%. Lower than kernel 3 either way, and 5.4× faster.');
+
+  // ------------------------------------------------------------ 10.3 TLP vs ILP
+  (function () {
+    const S = MB.scene('a-tlp', { w: 900, h: 460, title: 'Thread-level against instruction-level parallelism' });
+    const tl = S.tl;
+    const LAT = 4, cyc = 15, N = 24;
+    function panel(x0, title, sub) {
+      S.text({ x: x0, y: 40, text: title, size: 13.5, fill: K.ink, weight: 600 });
+      S.text({ x: x0, y: 58, text: sub, size: 11, fill: K.muted });
+      for (let c = 0; c <= N; c += 4) {
+        S.line({ x1: x0 + c * cyc, y1: 76, x2: x0 + c * cyc, y2: 330, stroke: '#eeebe3', sw: 1 });
+        S.text({ x: x0 + c * cyc, y: 342, text: '' + c, anchor: 'middle', size: 9.5, fill: K.muted });
+      }
+      S.text({ x: x0, y: 358, text: 'clock cycles →', size: 10, fill: K.muted });
+      // issue-slot row
+      S.text({ x: x0 - 6, y: 90, text: 'issued', anchor: 'end', size: 10.5, fill: K.muted });
+      const slots = [];
+      for (let c = 0; c < N; c++) slots.push(S.rect({ x: x0 + c * cyc + 1, y: 82, w: cyc - 2, h: 14, fill: '#f1efe8', stroke: 'none', rx: 2 }));
+      return slots;
+    }
+    const L = 70, R = 490;
+    const slotsL = panel(L, 'kernel 3: one accumulator per warp', 'each FMA must wait for the previous one (~4 cycles)');
+    const slotsR = panel(R, 'kernel 5: 64 independent accumulators', 'the next FMA never waits for the previous one');
+    const busyL = S.counter({ x: L, y: 400, label: 'issue slots used (of 24)', value: 0, size: 20 });
+    const warpsL = S.counter({ x: L + 200, y: 400, label: 'resident warps needed', value: 0, size: 20 });
+    const busyR = S.counter({ x: R, y: 400, label: 'issue slots used (of 24)', value: 0, size: 20 });
+    const warpsR = S.counter({ x: R + 200, y: 400, label: 'resident warps needed', value: 0, size: 20 });
+    const wc = [K.A, K.B, K.C, K.purple];
+    // left: 4 warps, each issues an FMA every 4 cycles
+    const rowsL = [], rowsR = [];
+    for (let w = 0; w < 4; w++) {
+      S.text({ x: L - 6, y: 125 + w * 50, text: 'warp ' + w, anchor: 'end', size: 10.5, fill: wc[w] });
+      const boxes = [];
+      for (let c = w; c < N; c += LAT) boxes.push(S.rect({ x: L + c * cyc + 1, y: 112 + w * 50, w: LAT * cyc - 2, h: 26, fill: '#fff', stroke: wc[w], sw: 1.2, rx: 3, opacity: 0 }));
+      rowsL.push(boxes);
+    }
+    S.text({ x: R - 6, y: 125, text: 'warp 0', anchor: 'end', size: 10.5, fill: wc[0] });
+    for (let c = 0; c < N; c++) rowsR.push(S.rect({ x: R + c * cyc + 1, y: 112 + (c % 4) * 8, w: LAT * cyc - 2, h: 7, fill: K.tealfill, stroke: K.teal, sw: 0.8, rx: 2, opacity: 0 }));
+    const noteL = S.text({ x: L, y: 300, text: '', size: 11, fill: K.muted });
+    const noteR = S.text({ x: R, y: 300, text: '', size: 11, fill: K.muted });
+
+    tl.step('A multiply-add takes about four cycles to deliver its result. In kernel 3 the next FMA needs that result, so after issuing one, <b>warp 0 waits four cycles</b>.');
+    rowsL[0].forEach((b, i) => { tl.show(b, 0.2, { at: i === 0 ? '>' : '<+0.35' }); });
+    for (let c = 0; c < N; c += LAT) tl.to(slotsL[c], { fill: wc[0] }, 0.1, { at: c === 0 ? '<' : '<+0.35' });
+    tl.to(busyL.num, { value: 6 }, 0.5, { at: '<' });
+    tl.to(warpsL.num, { value: 1 }, 0.3, { at: '<' });
+    tl.set(noteL, { text: 'one warp fills 6 of 24 slots: the lanes idle three cycles in four' });
+    tl.wait(1.8);
+    tl.step('The scheduler fills the gaps by switching to other <b>resident warps</b>. With four warps, every slot is used. That is thread-level parallelism, and it needs occupancy.');
+    for (let w = 1; w < 4; w++) {
+      rowsL[w].forEach((b, i) => { tl.show(b, 0.15, { at: i === 0 ? '>' : '<+0.1' }); });
+      for (let c = w; c < N; c += LAT) tl.to(slotsL[c], { fill: wc[w] }, 0.1, { at: c === w ? '<' : '<+0.1' });
+      tl.to(busyL.num, { value: 6 * (w + 1) }, 0.4, { at: '<' });
+      tl.to(warpsL.num, { value: w + 1 }, 0.3, { at: '<' });
+    }
+    tl.set(noteL, { text: 'four warps × 6 FMAs = 24 slots: full, but only because four warps were resident' });
+    tl.wait(2.0);
+    tl.step('Kernel 5’s warp has 64 multiply-adds that do not depend on each other. It issues one <b>every cycle</b>, on its own. Instruction-level parallelism needs no second warp.');
+    rowsR.forEach((b, c) => { tl.show(b, 0.12, { at: c === 0 ? '>' : '<+0.08' }); tl.to(slotsR[c], { fill: K.teal }, 0.1, { at: '<' }); });
+    tl.to(busyR.num, { value: 24 }, 2.0, { at: '<-1.9', ease: 'linear' });
+    tl.to(warpsR.num, { value: 1 }, 0.3);
+    tl.set(noteR, { text: 'one warp fills all 24 slots: up to four FMAs in flight at once' });
+    tl.wait(2.0);
+    tl.step('So kernel 5 buys with instruction-level parallelism what kernel 3 had to buy with warps, and the same registers that make this possible also cut its shared-memory traffic 8×. Lower occupancy, 5.4× the speed.');
+    tl.wait(3.2);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 10.4 why not 16x16
+  (function () {
+    const S = MB.scene('a-sweet', { w: 900, h: 420, title: 'The thread-tile trade: registers against loads per FMA' });
+    const tl = S.tl;
+    const x0 = 250, W = 380;
+    S.text({ x: x0, y: 40, text: 'registers a thread needs (accumulators + operands)', size: 12.5, fill: K.ink, weight: 600 });
+    const cap = S.line({ x1: x0 + W * 255 / 300, y1: 50, x2: x0 + W * 255 / 300, y2: 150, stroke: K.red, sw: 1.5, dash: '5 4', opacity: 0 });
+    const capL = S.text({ x: x0 + W * 255 / 300 + 6, y: 56, text: '255: the most one thread can have', size: 11, fill: K.red, weight: 600, opacity: 0 });
+    const tiles = [{ n: '4 × 4', regs: 24, lpf: 0.5 }, { n: '8 × 8', regs: 80, lpf: 0.25 }, { n: '16 × 16', regs: 288, lpf: 0.125 }];
+    const rb = tiles.map((t, i) => S.bar({ x: x0, y: 60 + i * 30, w: 0, h: 20, fill: K.goldfill, stroke: K.gold, label: t.n + ' thread tile', value: 0 }));
+    S.text({ x: x0, y: 190, text: 'shared-memory loads per FMA', size: 12.5, fill: K.ink, weight: 600 });
+    const lb = tiles.map((t, i) => S.bar({ x: x0, y: 210 + i * 30, w: 0, h: 20, fill: K.redfill, stroke: K.red, label: t.n + ' thread tile', value: 0, format: v => v.toFixed(3) }));
+    const note = S.text({ x: 40, y: 330, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 352, text: '', size: 12, fill: K.muted });
+    const note3 = S.text({ x: 40, y: 374, text: '', size: 12, fill: K.muted });
+
+    tl.step('A 4 × 4 tile needs about 24 registers (16 accumulators + 4 + 4) and lets the SM fill every warp slot, but it spends <b>0.5 loads per FMA</b>: twice kernel 5’s.');
+    rb[0].grow(tl, W * 24 / 300, 24, 0.6); lb[0].grow(tl, W * 0.5 / 0.5, 0.5, 0.6, { at: '<' });
+    tl.set(note, { text: '4 × 4: (4 + 4) loads for 16 FMAs = 0.5 — the ratio chapter 7 said binds' });
+    tl.wait(1.8);
+    tl.step('The 8 × 8 tile needs 80 registers and lands at 50% occupancy, but it reaches the <b>0.25</b> supply line. This is kernel 5.');
+    rb[1].grow(tl, W * 80 / 300, 80, 0.6); lb[1].grow(tl, W * 0.25 / 0.5, 0.25, 0.6, { at: '<' });
+    tl.set(note2, { text: '8 × 8: (8 + 8) loads for 64 FMAs = 0.25 — at 80 registers, three blocks fit, 24 warps' });
+    tl.wait(1.8);
+    tl.step('A 16 × 16 tile would need 256 accumulators plus 32 operands: <b>288 registers</b>, more than the 255 a thread can have at all. Even at the cap, one block per SM, and nothing could hide latency.');
+    tl.show([cap, capL], 0.3);
+    rb[2].grow(tl, W * 288 / 300, 288, 0.8); lb[2].grow(tl, W * 0.125 / 0.5, 0.125, 0.6, { at: '<' });
+    tl.to(rb[2].rect, { fill: K.redfill, stroke: K.red }, 0.3);
+    tl.set(note3, { text: '16 × 16: 0.125 loads per FMA, but impossible — the register file is finite per thread (255) and per SM (65,536)' });
+    tl.wait(1.8);
+    tl.step('So the tile sits near the sweet spot of a trade with two sides. Autotuning, in chapter 12, is how that spot gets found on a real chip: by measuring.');
+    tl.wait(3.0);
+    S.finish();
+  })();
+})();
+</script>
+</body>
+</html>
