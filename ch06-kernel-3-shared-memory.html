@@ -38,7 +38,7 @@
 
 <p>Every number the block needs, it drags across the bus 32 times. Not a value here and there — all 261,888 of them, exactly 32 times each, and the 32 isn't an accident of the numbers.</p>
 
-<p>This is a different count from chapter 5's. There the waste was <em>between</em> blocks: 128 blocks along a row of tiles, each pulling in the same strip of A. Here we are inside a single block, counting only what that one block does on its own, and the two redundancies stack. Kernel 3 goes after this one and leaves the other alone — the between-block re-reads are what the L2 cache has been quietly absorbing all along, which is the arithmetic chapter 5's aside worked through.</p>
+<p>This is a different count from chapter 5's. There the waste was <em>between</em> blocks: 128 blocks along a row of tiles, each pulling in the same strip of A. Here we are inside a single block, counting only what that one block does on its own, and the two redundancies stack. Kernel 3 goes after this one and leaves the other alone — the between-block re-reads are the ones the L2 cache has been quietly absorbing, as chapter 5's aside worked out.</p>
 
 <h2><span class="no">6.2</span>Where the 32 comes from</h2>
 
@@ -51,6 +51,8 @@
 <p>So the 32 is the tile's edge length, seen from two directions. And the fix writes itself: fetch each value once, and put it somewhere all 32 threads can reach.</p>
 
 <p>A register won't do. A register belongs to one thread and no other thread can see it, which is the same property that made it free to read. Shared memory is the other thing on the SM: a scratchpad of up to 48 KB per block, sitting physically on the chip beside the arithmetic units, visible to every thread of that block. Nothing arrives there by accident — you write the copy yourself, as an ordinary assignment — and once a value is in it, reading it costs on the order of 20 to 30 cycles instead of the several hundred a trip to DRAM costs.</p>
+
+<p>The contrast with a cache is the part to keep. A cache decides for you. It holds what you touched recently, by a policy you don't control, and it may or may not still have your value by the time you come back for it — which is exactly why chapter 5 could say the L2 softens a bad access pattern without repairing it. Shared memory decides nothing. It holds what you put there, for as long as you leave it there, and if you want a value in it you have to write the line that copies it. That is more work, and the extra work is the whole reason it can be counted on.</p>
 
 <figure class="wide">
   <div id="a-redundancy"></div>
@@ -105,7 +107,9 @@ C += cRow * BLOCKSIZE * N + cCol * BLOCKSIZE;
 }
 C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol];</code></pre>
 
-<p>Look at the copy first. A chunk holds 32 × 32 = 1,024 elements and the block has 1,024 threads, so each thread copies exactly one element of A and one of B. No loop, no leftover, no thread sitting idle. And the indexing is the one chapter 5 arrived at: <code>threadCol</code> is <code>threadIdx.x % 32</code>, so it runs 0 to 31 across a warp while <code>threadRow</code> stays fixed, which makes the warp's 32 addresses for <code>A[threadRow * K + threadCol]</code> consecutive. The copy is coalesced. Two thousand and forty-eight global loads for the whole block, and that is the entire business this chunk has with global memory.</p>
+<p>The three lines above the loop are bookkeeping: they move each pointer to where this block's work begins, A to the top of its 32-row strip, B to the left edge of its 32-column strip, C to the corner of its tile. Everything after that is written as though the block were the whole problem — <code>threadRow</code> and <code>threadCol</code> run 0 to 31 and mean "inside this tile" — which is why the two copies look like they are reading the top-left corner of A and B when they are usually reading somewhere in the middle of a 4,092 × 4,092 matrix. The two bumps inside the loop, <code>A += BLOCKSIZE</code> and <code>B += BLOCKSIZE * N</code>, slide that window along k: 32 columns to the right in A, 32 rows down in B.</p>
+
+<p>Now look at the copy. A chunk holds 32 × 32 = 1,024 elements and the block has 1,024 threads, so each thread copies exactly one element of A and one of B. No loop, no leftover, no thread sitting idle. And the indexing is the one chapter 5 arrived at: <code>threadCol</code> is <code>threadIdx.x % 32</code>, so it runs 0 to 31 across a warp while <code>threadRow</code> stays fixed, which makes the warp's 32 addresses for <code>A[threadRow * K + threadCol]</code> consecutive. The copy is coalesced. Two thousand and forty-eight global loads for the whole block, and that is the entire business this chunk has with global memory.</p>
 
 <p>Now follow thread (5, 9) — the one that owns C[5][9] of the tile — through a single chunk.</p>
 
@@ -125,6 +129,8 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
 
 <p>The sharing never went away. Row 5 of As is still read by all 32 threads that own row 5 of the tile, and column 9 of Bs is still read by the 32 threads in column 9. What changed is where they read it from: one slow trip to global memory and then 32 fast reads out of the scratchpad, instead of 32 slow trips.</p>
 
+<p>And <code>tmp</code> is exactly where kernel 2 left it — a register, private to the thread, not written to memory until the last line of the kernel. Nothing about the tiling touches it. What the kernel has now is all three levels of the hierarchy in play at once: a register for the running total, shared memory for the operands of the chunk in front of it, global memory for everything it hasn't reached yet. Every kernel from here on keeps that shape; what changes is how much of the work each level is asked to carry.</p>
+
 <h2><span class="no">6.5</span>What a barrier is</h2>
 
 <p>Two lines in that loop do no arithmetic at all, and the kernel is wrong without either of them.</p>
@@ -134,6 +140,8 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
 <p>You need it because threads don't run in lockstep. A block's 32 warps are handed to the SM's four schedulers, and a scheduler runs whichever of its warps is ready — a warp waiting on a load steps aside and another one runs in its place. Some warps get a long way ahead. Without the first barrier, a thread that has finished its own copy can walk straight into the inner loop and read As[5][17] before the thread responsible for As[5][17] has written it. What it gets is whatever was sitting in that slot: the previous chunk's value, or uninitialized memory on the first chunk. The answer comes out wrong, sometimes, depending on how the warps happened to be scheduled, which is about the worst kind of wrong there is.</p>
 
 <p>The second barrier prevents the mirror image. Once a fast thread finishes its 32 multiply-adds it wants to start the next chunk's copy, and that copy overwrites As and Bs. If a slow thread is still on d = 20 of its inner loop, the values under it change while it is reading them.</p>
+
+<p>There is no cheaper version of this. You can't replace either barrier with an argument about which warp gets there first, because there is no such argument available: the schedulers run whichever warp is ready, and which one that is depends on what all the others happened to be waiting for. The barrier is the only thing in the kernel that makes any statement about order.</p>
 
 <figure class="wide">
   <div id="a-barrier"></div>
@@ -149,7 +157,7 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
 
 <p>Per chunk, per block: 2,048 global loads, 65,536 shared-memory reads, 32,768 multiply-adds. Over 128 chunks the block issues 262,144 global loads, against kernel 2's 8,380,416. That is the factor of 32 we set out to get, and it lands almost exactly on the 261,888 distinct values the block needs. Each number is fetched once.</p>
 
-<p>Per element of C the same thing reads: kernel 2 spent 2K = 8,184 global loads on every output; kernel 3 spends K/16 = 256.</p>
+<p>Per element of C the same thing reads: kernel 2 spent 2K = 8,184 global loads on every output; kernel 3 spends K/16 = 256. That second number comes straight out of the loop — each thread does two global loads per chunk, one element of A and one of B, and there are 128 chunks.</p>
 
 <div class="key">
   <div class="t">Key</div>
@@ -163,9 +171,9 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
 
 <p>Boehm measures 2,980.3 GFLOP/s, up from 1,986.5. That is 1.5×, and it takes the kernel from 8.5% of cuBLAS to 12.8%.</p>
 
-<p>It is worth sitting with that for a moment, because a 32× cut in global traffic buying 1.5× in speed is a large miss, not a small one. If global memory had still been the thing this kernel waited on, cutting its traffic by 32 would have shown up as something close to 32×. Chapter 5 made a prediction of exactly that shape, out of nothing but a sector count, and it came in within 3%. Run the same reasoning here and it is off by a factor of twenty.</p>
+<p>A 32× cut in global traffic buying 1.5× in speed is a large miss, not a small one. If global memory had still been the thing this kernel waited on, cutting its traffic by 32 would have shown up as something close to 32×. Chapter 5 made a prediction of exactly that shape, out of nothing but a sector count, and it landed within 3%. Run the same reasoning here and it is off by a factor of twenty.</p>
 
-<p>The reasoning isn't what broke; the premise underneath it is. Global memory stopped being the limit somewhere between kernel 2 and this one, and the kernel is now waiting on something else. Finding out what turns out to be the most useful measurement in the book, because every kernel from 4 onward is an attack on it. That is the next chapter.</p>
+<p>The reasoning isn't what broke; the premise underneath it is. Global memory stopped being the limit somewhere between kernel 2 and this one, and the kernel is now waiting on something else. Naming that something is the next chapter's job, and it is the hinge of the book: every kernel from 4 onward is an attack on what chapter 7 finds.</p>
 
 <div class="pager"></div>
 <div class="colophon">Every number in the animations is computed rather than typed in: the counts follow from BLOCKSIZE = 32 and K = 4,092, the byte figures from 4-byte floats against a 48 KB shared-memory budget, and the dot product in figure 6.4 is a real one — two 4,092-element integer vectors generated from fixed seeds in your browser and summed chunk by chunk as the animation plays. The GFLOP/s figures and kernel 3's source (<code>sgemm_shared_mem_block</code> in the <a href="https://github.com/siboehm/SGEMM_CUDA">SGEMM_CUDA</a> repository) are Simon Boehm's, from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>.</div>
