@@ -6,7 +6,7 @@
 <title>Kernel 3: caching a tile in shared memory · How a Matmul Kernel Gets Fast</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="assets/book.css">
+<link rel="stylesheet" href="assets/book.css?v=6">
 </head>
 <body>
 <div class="frame">
@@ -16,69 +16,69 @@
 
 <div class="kicker">Chapter 6 · <em>The memory-starved kernels</em></div>
 <h1>Kernel 3: caching a tile in shared memory</h1>
-<p class="lede">Inside one block, every number is fetched thirty-two times. This kernel fetches it once, into a scratchpad the whole block can read — and gets a lot less for it than the arithmetic suggests.</p>
+<p class="lede">Inside one block, every number is fetched thirty-two times. This kernel fetches it once, into a scratchpad the whole block can read. We watch it run, every load and every multiply, on a version small enough to see all of.</p>
 <div class="byline">Kernel · <em>sgemm_shared_mem_block</em> · 2,980 GFLOP/s · 12.8% of cuBLAS · measured by Simon Boehm on an NVIDIA A6000</div>
 
 <p>Kernel 2 fixed the shape of every request and left the number of requests exactly where kernel 1 had it: 137 billion loads, 548 GB asked for. Chapter 5 ended by naming the two kinds of redundancy hiding behind that number. Between blocks, all 128 blocks along a row of tiles read the same row strip of A. Inside a block, the thread that owns C[0][0] and the thread that owns C[0][1] both walk the whole of row 0 of A, and each of them fetches it separately.</p>
 
-<p>This chapter is about the second one. It has a number attached, and the number is 32.</p>
+<p>This chapter is about the second one. The fix is short (nine lines change) but it introduces a new kind of memory, a new kind of instruction, and a loop with a different shape, and all three are easier to see than to describe. So this chapter is built around a version of the kernel that is small enough to draw completely.</p>
 
-<h2><span class="no">6.1</span>What one block needs</h2>
+<h2><span class="no">6.1</span>A version small enough to see all of</h2>
 
-<p>Follow one block — say the one computing the 32 × 32 tile in the top-left corner of C. Its 32 rows of output depend on rows 0 through 31 of A, every one of their 4,092 columns. Its 32 columns of output depend on columns 0 through 31 of B, all 4,092 rows. Nothing else in either matrix can change this block's answers. Count them: 2 × 32 × 4,092 = 261,888 distinct numbers, and that is everything the block will ever need.</p>
+<p>Everything in kernel 3 comes in units of one number, <code>BLOCKSIZE</code>. The block computes a <code>BLOCKSIZE × BLOCKSIZE</code> tile of C, so it has <code>BLOCKSIZE²</code> threads. It walks the k dimension in chunks of <code>BLOCKSIZE</code>. The two tiles it keeps in shared memory are <code>BLOCKSIZE × BLOCKSIZE</code> each. Boehm's kernel uses 32, and 32 × 32 = 1,024 threads over 4,092 values of k is far too much to draw a cell at a time.</p>
 
-<p>Now count what kernel 2's block actually pulls in. There are 1,024 threads, each runs the k-loop 4,092 times, and each pass issues two loads. That is 1,024 × 4,092 × 2 = 8,380,416 loads.</p>
+<p>So for this chapter, set <code>BLOCKSIZE</code> to 4 and K to 8. The block is now 16 threads computing a 4 × 4 tile of C; it needs a 4 × 8 slab of A and an 8 × 4 slab of B; k breaks into two chunks of four; and the shared-memory tiles are 4 × 4. Nothing else changes. It is the same code, the same one-thread-per-output, the same rule that each thread copies exactly one element of A and one of B per chunk. The numbers are the top-left corner of the 8 × 8 example the book has used since chapter 4, so every product you see is a real one.</p>
 
-<p>8,380,416 ÷ 261,888 = 32.</p>
+<div class="tablewrap"><table>
+<tr><th></th><th>The miniature (this chapter)</th><th>Boehm's kernel 3</th></tr>
+<tr><td>BLOCKSIZE</td><td>4</td><td>32</td></tr>
+<tr><td>K (length of each dot product)</td><td>8</td><td>4,092</td></tr>
+<tr><td>Threads per block, one per output</td><td>16</td><td>1,024</td></tr>
+<tr><td>Chunks of k</td><td>2</td><td>128</td></tr>
+<tr><td>As and Bs, the two shared-memory tiles</td><td>4 × 4 each, 128 B in total</td><td>32 × 32 each, 8 KB in total</td></tr>
+<tr><td>Elements each thread copies per chunk</td><td>1 of A, 1 of B</td><td>1 of A, 1 of B</td></tr>
+</table></div>
 
-<figure class="wide">
-  <div id="a-needs"></div>
-  <figcaption><b>Figure 6.1.</b> What one block needs against what it fetches. Each drawn cell of C is one 32 × 32 tile (one block), each drawn row of A is that block's 32-row strip. The two counters at the bottom are the same block, measured two ways.</figcaption>
-</figure>
+<h2><span class="no">6.2</span>The problem, seen whole</h2>
 
-<p>Every number the block needs, it drags across the bus 32 times. Not a value here and there — all 261,888 of them, exactly 32 times each, and the 32 isn't an accident of the numbers.</p>
+<p>First, kernel 2 on the miniature, so the thing we are fixing is in plain view. Sixteen threads, one per cell of C. Thread (1, 2) owns C[1][2], so it needs row 1 of A and column 2 of B, and it walks them with the loop from chapter 5: at each k it loads one value of A and one of B from global memory, multiplies, and adds into <code>tmp</code>. Eight steps, sixteen loads, all of them trips to DRAM.</p>
 
-<p>This is a different count from chapter 5's. There the waste was <em>between</em> blocks: 128 blocks along a row of tiles, each pulling in the same strip of A. Here we are inside a single block, counting only what that one block does on its own, and the two redundancies stack. Kernel 3 goes after this one and leaves the other alone — the between-block re-reads are the ones the L2 cache has been quietly absorbing, as chapter 5's aside worked out.</p>
-
-<h2><span class="no">6.2</span>Where the 32 comes from</h2>
-
-<p>Take one number: A[0][7]. Which threads want it?</p>
-
-<p>Every thread whose output sits in row 0 of the tile. A thread computing C[0][j] walks the whole of row 0 of A whatever j is, so on the eighth pass of its loop it asks for A[0][7]. There are 32 such threads, one per column of the tile, and each of them issues its own load. Thirty-two round trips to global memory for a number that hasn't changed since the kernel launched.</p>
-
-<p>B is the same picture with the axes swapped. B[3][9] is wanted by every thread whose output is in column 9 of the tile: 32 threads, one per row, each fetching it separately.</p>
-
-<p>So the 32 is the tile's edge length, seen from two directions. And the fix writes itself: fetch each value once, and put it somewhere all 32 threads can reach.</p>
-
-<p>A register won't do. A register belongs to one thread and no other thread can see it, which is the same property that made it free to read. Shared memory is the other thing on the SM: a scratchpad of up to 48 KB per block, sitting physically on the chip beside the arithmetic units, visible to every thread of that block. Nothing arrives there by accident — you write the copy yourself, as an ordinary assignment — and once a value is in it, reading it costs on the order of 20 to 30 cycles instead of the several hundred a trip to DRAM costs.</p>
-
-<p>The contrast with a cache is the part to keep. A cache decides for you. It holds what you touched recently, by a policy you don't control, and it may or may not still have your value by the time you come back for it — which is exactly why chapter 5 could say the L2 softens a bad access pattern without repairing it. Shared memory decides nothing. It holds what you put there, for as long as you leave it there, and if you want a value in it you have to write the line that copies it. That is more work, and the extra work is the whole reason it can be counted on.</p>
+<p>Now look at the three other threads in row 1 of the tile. They own C[1][0], C[1][1] and C[1][3], so they walk the same row 1 of A, and each of them loads every one of its values on its own. Four threads, four separate trips for the same number, and the same again for every column of B.</p>
 
 <figure class="wide">
-  <div id="a-redundancy"></div>
-  <figcaption><b>Figure 6.2.</b> Where the factor of 32 comes from. One value of A is wanted by a whole row of the thread tile, one value of B by a whole column, and in kernel 2 each of those threads goes and gets it on its own.</figcaption>
+  <div id="a-k2mini"></div>
+  <figcaption><b>Figure 6.1.</b> Kernel 2 on the miniature. Thread (1, 2) fetches sixteen values from global memory to do eight multiply-adds; then the count for the whole block, which fetches every value it needs four times over. In the real kernel the tile edge is 32, so the factor is 32.</figcaption>
 </figure>
 
-<h2><span class="no">6.3</span>Why we can't preload everything</h2>
+<p>The count at the end of the animation is the whole problem. The block needs 4 × 8 + 8 × 4 = 64 distinct numbers and it issues 16 × 8 × 2 = 256 loads: every number, four times, because a tile with four columns has four threads walking each row of A, and a tile with four rows has four threads walking each column of B. At full size the tile has 32 of each, the block needs 2 × 32 × 4,092 = 261,888 numbers, and it issues 1,024 × 4,092 × 2 = 8,380,416 loads. Thirty-two times over.</p>
 
-<p>The obvious move is to copy all 261,888 numbers into shared memory once at the start and never touch global memory again. It doesn't fit, and it isn't close.</p>
+<h2><span class="no">6.3</span>The idea: fetch once, read four times</h2>
 
-<p>A's strip is 32 × 4,092 floats, which is 523,776 bytes, about 512 KB. B's strip is another 512 KB. The budget is 48 KB. We are over by a factor of about 21.</p>
+<p>The fix writes itself once the picture is in front of you. Fetch each value from global memory once, put it somewhere all four threads can reach, and let them read it from there.</p>
 
-<p>But the loop is an accumulation, and an accumulation doesn't need all of its terms at once. <code>tmp += A[…] * B[…]</code> can eat the k dimension in pieces, as long as the pieces cover it in the end. So chop k into chunks of 32.</p>
+<p>A register won't do. A register belongs to one thread and no other thread can see it, which is the same property that made it free to read. Shared memory is the other thing on the SM: a scratchpad of up to 48 KB per block, sitting physically on the chip beside the arithmetic units, visible to every thread of that block. Nothing arrives there by accident; you write the copy yourself, as an ordinary assignment. And once a value is in it, reading it costs on the order of 20 to 30 cycles instead of the several hundred a trip to DRAM costs.</p>
 
-<p>One chunk of A is then a 32 × 32 square: 1,024 floats, 4 KB. One chunk of B is another 4 KB. Eight kilobytes for a pair, comfortably inside the 48. And 4,092 ÷ 32 = 127.9, so the k dimension breaks into 128 chunks, the last of them partial.</p>
+<figure class="wide">
+  <div id="a-idea"></div>
+  <figcaption><b>Figure 6.2.</b> One value, A[1][3], and the four threads that want it. Kernel 2 makes four slow trips. Kernel 3 makes one slow trip into shared memory and then four fast reads out of it. The cycle counts are rough; the shape of the trade is exact.</figcaption>
+</figure>
+
+<p>The contrast with a cache is the part to keep. A cache decides for you. It holds what you touched recently, by a policy you don't control, and it may or may not still have your value by the time you come back for it, which is exactly why chapter 5 could say the L2 softens a bad access pattern without repairing it. Shared memory decides nothing. It holds what you put there, for as long as you leave it there, and if you want a value in it you have to write the line that copies it. That is more work, and the extra work is the whole reason it can be counted on.</p>
+
+<h2><span class="no">6.4</span>Why we can't copy everything at once</h2>
+
+<p>In the miniature the whole slab of A is 32 numbers and the whole slab of B another 32, and 256 bytes would fit in shared memory a hundred times over. At full size it doesn't fit, and it isn't close. A's strip is 32 × 4,092 floats, which is 523,776 bytes, about 512 KB. B's strip is another 512 KB. The budget is 48 KB. We are over by a factor of about 21.</p>
+
+<p>But the loop is an accumulation, and an accumulation doesn't need all of its terms at once. <code>tmp += A[…] * B[…]</code> can eat the k dimension in pieces, as long as the pieces cover it in the end. So chop k into chunks of <code>BLOCKSIZE</code>. One chunk of A is then a 32 × 32 square: 1,024 floats, 4 KB. One chunk of B is another 4 KB. Eight kilobytes for a pair, comfortably inside the 48. And 4,092 ÷ 32 = 127.9, so the k dimension breaks into 128 chunks, the last of them partial. In the miniature the same rule gives two chunks of four.</p>
 
 <figure class="wide">
   <div id="a-fit"></div>
   <figcaption><b>Figure 6.3.</b> The two strips against the shared-memory budget, drawn to scale, and then one chunk of each against the same budget. The strips overshoot by 21×; a pair of chunks uses a sixth of what's available.</figcaption>
 </figure>
 
-<p>Hold one pair, add its 32 products into the running total, throw it away, load the next pair. The register holding the total is never reset, so after 128 rounds it holds the full 4,092-term dot product — the same number kernel 2 computed, out of a thirty-second of the traffic.</p>
+<h2><span class="no">6.5</span>Kernel 3, every step</h2>
 
-<h2><span class="no">6.4</span>The cooperative load, and one chunk step by step</h2>
-
-<p>Here is the kernel. It is still one thread per output element, and the inner arithmetic is still one multiply-add per k step; what's new is the copy at the top of the loop and the two barriers around it.</p>
+<p>Here is Boehm's kernel, with <code>BLOCKSIZE</code> = 32. It is still one thread per output element and the inner arithmetic is still one multiply-add per k step. What's new is the two copies at the top of the loop, the two barriers around the arithmetic, and the fact that the arithmetic reads <code>As</code> and <code>Bs</code>, which live in shared memory, instead of A and B.</p>
 
 <pre><code><span class="c">// BLOCKSIZE = 32; one 1-D block of 1,024 threads computes the tile at (cRow, cCol)</span>
 <span class="k">const uint</span> threadRow = threadIdx.x / BLOCKSIZE;   <span class="c">// 0 … 31</span>
@@ -107,67 +107,66 @@ C += cRow * BLOCKSIZE * N + cCol * BLOCKSIZE;
 }
 C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol];</code></pre>
 
-<p>The three lines above the loop are bookkeeping: they move each pointer to where this block's work begins, A to the top of its 32-row strip, B to the left edge of its 32-column strip, C to the corner of its tile. Everything after that is written as though the block were the whole problem — <code>threadRow</code> and <code>threadCol</code> run 0 to 31 and mean "inside this tile" — which is why the two copies look like they are reading the top-left corner of A and B when they are usually reading somewhere in the middle of a 4,092 × 4,092 matrix. The two bumps inside the loop, <code>A += BLOCKSIZE</code> and <code>B += BLOCKSIZE * N</code>, slide that window along k: 32 columns to the right in A, 32 rows down in B.</p>
+<p>The three lines above the loop are bookkeeping: they move each pointer to where this block's work begins, A to the top of its 32-row strip, B to the left edge of its 32-column strip, C to the corner of its tile. Everything after that is written as though the block were the whole problem. <code>threadRow</code> and <code>threadCol</code> run 0 to 31 and mean "inside this tile", which is why the two copies look like they are reading the top-left corner of A and B when they are usually reading somewhere in the middle of a 4,092 × 4,092 matrix. The two bumps inside the loop, <code>A += BLOCKSIZE</code> and <code>B += BLOCKSIZE * N</code>, slide that window along k: 32 columns to the right in A, 32 rows down in B.</p>
 
-<p>Now look at the copy. A chunk holds 32 × 32 = 1,024 elements and the block has 1,024 threads, so each thread copies exactly one element of A and one of B. No loop, no leftover, no thread sitting idle. And the indexing is the one chapter 5 arrived at: <code>threadCol</code> is <code>threadIdx.x % 32</code>, so it runs 0 to 31 across a warp while <code>threadRow</code> stays fixed, which makes the warp's 32 addresses for <code>A[threadRow * K + threadCol]</code> consecutive. The copy is coalesced. Two thousand and forty-eight global loads for the whole block, and that is the entire business this chunk has with global memory.</p>
-
-<p>Now follow thread (5, 9) — the one that owns C[5][9] of the tile — through a single chunk.</p>
-
-<p>It starts by copying its one element of A into As[5][9] and its one element of B into Bs[5][9]. Two loads from global memory, and they are the slow kind, hundreds of cycles each. Then it reaches the first <code>__syncthreads()</code> and stops. When it is let through, it runs the inner loop 32 times: <code>tmp += As[5][d] * Bs[d][9]</code> for d from 0 to 31. That is 32 reads along row 5 of As, 32 reads down column 9 of Bs, and 32 multiply-adds — and every one of those 64 reads comes out of shared memory, with global memory untouched. Then the second <code>__syncthreads()</code>, and then the window over row 5 of A slides 32 columns to the right and the whole thing happens again, into the same register, which nobody reset.</p>
+<p>Read the loop with the miniature's numbers and it says this. Thread (r, c) is one of sixteen. At the top of each chunk it copies A[r][c] of the current window into As[r][c], and B[r][c] of the current window into Bs[r][c]. One element of each; sixteen threads fill both 4 × 4 tiles. Then it waits at the barrier until all sixteen copies are in. Then it runs the inner loop four times, reading row r of As and column c of Bs, and adds four products into <code>tmp</code>. Then it waits at the second barrier. Then the window slides and it does it again. After the second chunk, <code>tmp</code> holds the whole eight-term dot product, and it writes it to C. The animation below runs exactly that, with the line of code being executed marked as it goes.</p>
 
 <figure class="wide">
-  <div id="a-chunk"></div>
-  <figcaption><b>Figure 6.4.</b> One chunk, start to finish, for thread (5, 9). The numbers are a real dot product: the two 4,092-element vectors are generated in your browser from fixed seeds and summed as the animation runs, chunk by chunk, into the gold register at the top.</figcaption>
+  <div id="a-k3"></div>
+  <figcaption><b>Figure 6.4.</b> Kernel 3 on the miniature, start to finish. Follow thread (1, 2), whose register is framed in the <code>tmp</code> grid: it copies one element of each matrix per chunk, waits, does four multiply-adds out of shared memory, waits, and after two chunks holds C[1][2] = 171. The other fifteen threads do the same in parallel. Use the step buttons; each step is one line of the kernel.</figcaption>
 </figure>
 
+<p>Three things to take from the run. The copies are the only lines that touch global memory, and across both chunks the block issued 64 of them, one for each of the 64 distinct values it needed. The inner loop touched only shared memory: 256 reads for the block, every one of them fast, and each As value was read by the four threads of its row, each Bs value by the four threads of its column. And <code>tmp</code> never moved. It sat in its register from the first product to the last, took the second chunk's products on top of the first's, and went to C exactly once.</p>
+
 <div class="ledger">
-  <div class="cell good"><div class="l">Global loads per chunk</div><div class="v">2,048</div><div class="d">1,024 threads × 1 element of A + 1 of B</div></div>
-  <div class="cell"><div class="l">Shared-memory reads</div><div class="v">65,536</div><div class="d">1,024 threads × 64 reads each</div></div>
-  <div class="cell"><div class="l">Multiply-adds</div><div class="v">32,768</div><div class="d">1,024 threads × 32; that's 65,536 FLOPs</div></div>
-  <div class="cell good"><div class="l">Shared reads per global load</div><div class="v">32</div><div class="d">the whole point of the kernel</div></div>
+  <div class="cell good"><div class="l">Global loads, the block</div><div class="v">64</div><div class="d">kernel 2 issued 256 · each of the 64 values once</div></div>
+  <div class="cell"><div class="l">Shared-memory reads</div><div class="v">256</div><div class="d">16 threads × 8 per chunk × 2 chunks</div></div>
+  <div class="cell"><div class="l">Multiply-adds</div><div class="v">128</div><div class="d">identical to kernel 2 · 16 outputs × 8 terms</div></div>
+  <div class="cell good"><div class="l">Shared reads per global load</div><div class="v">4</div><div class="d">32 in the real kernel · the point of it</div></div>
 </div>
 
-<p>The sharing never went away. Row 5 of As is still read by all 32 threads that own row 5 of the tile, and column 9 of Bs is still read by the 32 threads in column 9. What changed is where they read it from: one slow trip to global memory and then 32 fast reads out of the scratchpad, instead of 32 slow trips.</p>
+<p>Nothing about the sharing went away. Row 1 of As is still read by all four threads that own row 1 of the tile; column 2 of Bs is still read by the four threads in column 2. What changed is where they read it from: one slow trip to global memory and then four fast reads out of the scratchpad, instead of four slow trips.</p>
 
-<p>And <code>tmp</code> is exactly where kernel 2 left it — a register, private to the thread, not written to memory until the last line of the kernel. Nothing about the tiling touches it. What the kernel has now is all three levels of the hierarchy in play at once: a register for the running total, shared memory for the operands of the chunk in front of it, global memory for everything it hasn't reached yet. Every kernel from here on keeps that shape; what changes is how much of the work each level is asked to carry.</p>
-
-<h2><span class="no">6.5</span>What a barrier is</h2>
+<h2><span class="no">6.6</span>What a barrier is</h2>
 
 <p>Two lines in that loop do no arithmetic at all, and the kernel is wrong without either of them.</p>
 
-<p><code>__syncthreads()</code> makes every thread of the block stop at that line until all 1,024 of them have reached it. A meeting point, nothing more.</p>
+<p><code>__syncthreads()</code> makes every thread of the block stop at that line until all of them have reached it. A meeting point, nothing more.</p>
 
-<p>You need it because threads don't run in lockstep. A block's 32 warps are handed to the SM's four schedulers, and a scheduler runs whichever of its warps is ready — a warp waiting on a load steps aside and another one runs in its place. Some warps get a long way ahead. Without the first barrier, a thread that has finished its own copy can walk straight into the inner loop and read As[5][17] before the thread responsible for As[5][17] has written it. What it gets is whatever was sitting in that slot: the previous chunk's value, or uninitialized memory on the first chunk. The answer comes out wrong, sometimes, depending on how the warps happened to be scheduled, which is about the worst kind of wrong there is.</p>
+<p>You need it because threads don't run in lockstep. A block's warps are handed to the SM's four schedulers, and a scheduler runs whichever of its warps is ready; a warp waiting on a load steps aside and another one runs in its place. Some warps get a long way ahead. Without the first barrier, a thread that has finished its own copy can walk straight into the inner loop and read As[1][3] before the thread responsible for As[1][3] has written it. What it gets is whatever was sitting in that slot: the previous chunk's value, or uninitialized memory on the first chunk. The answer comes out wrong, sometimes, depending on how the warps happened to be scheduled, which is about the worst kind of wrong there is.</p>
 
-<p>The second barrier prevents the mirror image. Once a fast thread finishes its 32 multiply-adds it wants to start the next chunk's copy, and that copy overwrites As and Bs. If a slow thread is still on d = 20 of its inner loop, the values under it change while it is reading them.</p>
-
-<p>There is no cheaper version of this. You can't replace either barrier with an argument about which warp gets there first, because there is no such argument available: the schedulers run whichever warp is ready, and which one that is depends on what all the others happened to be waiting for. The barrier is the only thing in the kernel that makes any statement about order.</p>
+<p>The second barrier prevents the mirror image. Once a fast thread finishes its multiply-adds it wants to start the next chunk's copy, and that copy overwrites As and Bs. If a slow thread is still partway through its inner loop, the values under it change while it is reading them.</p>
 
 <figure class="wide">
   <div id="a-barrier"></div>
-  <figcaption><b>Figure 6.5.</b> Eight of the block's threads running through one chunk. Without the barrier a fast thread reads a slot a slow thread has not written yet; with it, everyone waits at the line until the last one arrives.</figcaption>
+  <figcaption><b>Figure 6.5.</b> Eight of a block's threads running through one chunk. Without the barrier a fast thread reads a slot a slow thread has not written yet; with it, everyone waits at the line until the last one arrives.</figcaption>
 </figure>
 
 <div class="aside">
   <div class="t">Aside · two bugs, one loop apart</div>
-  <p>Both failures are read-write races on shared memory and they are symmetric: the first barrier stops a read from overtaking a write, the second stops a write from overtaking a read. Both are timing-dependent, so a kernel missing one of them can pass a test and fail in production, or pass on one GPU and fail on the next. The fast threads do pay for the barriers — they stand at the line doing nothing until the last warp turns up — and that waiting is real, measurable time. It buys an answer that is the same every run.</p>
+  <p>Both failures are read-write races on shared memory and they are symmetric: the first barrier stops a read from overtaking a write, the second stops a write from overtaking a read. Both are timing-dependent, so a kernel missing one of them can pass a test and fail in production, or pass on one GPU and fail on the next. The fast threads do pay for the barriers (they stand at the line doing nothing until the last warp turns up) and that waiting is real, measurable time. It buys an answer that is the same every run.</p>
 </div>
 
-<h2><span class="no">6.6</span>How that turns into FLOPs</h2>
+<h2><span class="no">6.7</span>Back to full size</h2>
 
-<p>Per chunk, per block: 2,048 global loads, 65,536 shared-memory reads, 32,768 multiply-adds. Over 128 chunks the block issues 262,144 global loads, against kernel 2's 8,380,416. That is the factor of 32 we set out to get, and it lands almost exactly on the 261,888 distinct values the block needs. Each number is fetched once.</p>
+<p>The real kernel is the miniature with every 4 replaced by 32 and the 8 replaced by 4,092. Each thread still copies one element of A and one of B per chunk, and now there are 128 chunks, so the window over row 5 of A slides 32 columns at a time, 128 times, while <code>tmp</code> accumulates a 4,092-term dot product without ever leaving its register.</p>
 
-<p>Per element of C the same thing reads: kernel 2 spent 2K = 8,184 global loads on every output; kernel 3 spends K/16 = 256. That second number comes straight out of the loop — each thread does two global loads per chunk, one element of A and one of B, and there are 128 chunks.</p>
+<figure class="wide">
+  <div id="a-window"></div>
+  <figcaption><b>Figure 6.6.</b> The sliding window at full size, for one thread. The dot product is a real one: two 4,092-element vectors generated in your browser from fixed seeds and summed chunk by chunk as the window moves.</figcaption>
+</figure>
+
+<p>And the accounting scales the same way. Per chunk the block issues 2,048 global loads (1,024 threads × 2), does 65,536 shared-memory reads (1,024 × 64) and 32,768 multiply-adds. Over 128 chunks that is 262,144 global loads against kernel 2's 8,380,416: the factor of 32 we set out to get, landing almost exactly on the 261,888 distinct values the block needs. Per element of C, kernel 2 spent 2K = 8,184 global loads; kernel 3 spends K/16 = 256.</p>
+
+<figure class="wide">
+  <div id="a-scale"></div>
+  <figcaption><b>Figure 6.7.</b> The miniature scaled up to Boehm's kernel, number by number, and then the measurement. Traffic falls by 32; speed rises by 1.5.</figcaption>
+</figure>
 
 <div class="key">
   <div class="t">Key</div>
   <p>Shared memory didn't remove the sharing. It moved it: one slow trip to global memory, then 32 fast reads of the scratchpad, in place of 32 slow trips.</p>
 </div>
-
-<figure class="wide">
-  <div id="a-ledger3"></div>
-  <figcaption><b>Figure 6.6.</b> The three numbers side by side. Two of them move by a factor of 32; the third, which is the one we actually wanted, moves by 1.5.</figcaption>
-</figure>
 
 <p>Boehm measures 2,980.3 GFLOP/s, up from 1,986.5. That is 1.5×, and it takes the kernel from 8.5% of cuBLAS to 12.8%.</p>
 
@@ -176,159 +175,207 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
 <p>The reasoning isn't what broke; the premise underneath it is. Global memory stopped being the limit somewhere between kernel 2 and this one, and the kernel is now waiting on something else. Naming that something is the next chapter's job, and it is the hinge of the book: every kernel from 4 onward is an attack on what chapter 7 finds.</p>
 
 <div class="pager"></div>
-<div class="colophon">Every number in the animations is computed rather than typed in: the counts follow from BLOCKSIZE = 32 and K = 4,092, the byte figures from 4-byte floats against a 48 KB shared-memory budget, and the dot product in figure 6.4 is a real one — two 4,092-element integer vectors generated from fixed seeds in your browser and summed chunk by chunk as the animation plays. The GFLOP/s figures and kernel 3's source (<code>sgemm_shared_mem_block</code> in the <a href="https://github.com/siboehm/SGEMM_CUDA">SGEMM_CUDA</a> repository) are Simon Boehm's, from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>.</div>
+<div class="colophon">Every number in the animations is computed rather than typed in. The miniature is the top-left 4 × 8 block of A and 8 × 4 block of B from the book's shared 8 × 8 integer example, so its C is the corner of that product; the full-size counts follow from BLOCKSIZE = 32 and K = 4,092; the dot product in figure 6.6 is two 4,092-element integer vectors generated from fixed seeds in your browser and summed chunk by chunk as the animation plays. The GFLOP/s figures and kernel 3's source (<code>sgemm_shared_mem_block</code> in the <a href="https://github.com/siboehm/SGEMM_CUDA">SGEMM_CUDA</a> repository) are Simon Boehm's, from his <a href="https://siboehm.com/articles/22/CUDA-MMM">worklog</a>.</div>
 
 </article>
 </main>
 </div>
 
-<script src="assets/anim.js"></script>
-<script src="assets/nav.js"></script>
+<script src="assets/anim.js?v=6"></script>
+<script src="assets/nav.js?v=6"></script>
 <script>
 (function () {
   const K = MB.color;
+  // The miniature: A = rows 0–3 of A8 (4 × 8), B = columns 0–3 of B8 (8 × 4), C = their product,
+  // which is the top-left corner of C8.
+  const Am = MB.A8.slice(0, 4).map(r => r.slice(0, 8));
+  const Bm = MB.B8.slice(0, 8).map(r => r.slice(0, 4));
+  const Cm = MB.matmul(Am, Bm);
+  const partial = (k0, k1) => Am.map((row, i) => Bm[0].map((_, j) => { let s = 0; for (let k = k0; k < k1; k++) s += Am[i][k] * Bm[k][j]; return s; }));
+  const P0 = partial(0, 4), P1 = partial(4, 8);
+  const GMA = { fill: '#eef3fb', stroke: '#b9cdf0' };   // A, sitting in global memory
+  const GMB = { fill: '#eaf6ee', stroke: '#b5dcc3' };   // B, sitting in global memory
+  const HOT_A = { fill: K.Afill, stroke: K.A, sw: 1.4 };
+  const HOT_B = { fill: K.Bfill, stroke: K.B, sw: 1.4 };
 
-  // ------------------------------------------------------------ 6.1 what one block needs
+  // a small value packet: a rounded square carrying one number
+  function packet(S, x, y, v, fill, stroke, size) {
+    size = size || 20;
+    const g = S.group({ tx: x, ty: y, opacity: 0 });
+    g.rect({ x: -size / 2, y: -size / 2, w: size, h: size, fill, stroke, sw: 1.2, rx: 3 });
+    const t = g.text({ x: 0, y: 0.5, text: v, anchor: 'middle', size: size * 0.56, fill: K.ink, weight: 600 });
+    g.pivot(0, 0);
+    return { g, t };
+  }
+
+  // ------------------------------------------------------------ 6.1 kernel 2 on the miniature
   (function () {
-    const S = MB.scene('a-needs', { w: 900, h: 430, title: 'What one block needs against what kernel 2 fetches for it' });
-    const tl = S.tl, mc = 25;
-    const base = { rows: 8, cols: 8, cell: mc, fill: '#f7f6f2', stroke: '#ddd9cf', sw: 0.6, labelSize: 15 };
+    const S = MB.scene('a-k2mini', { w: 900, h: 520, title: 'Kernel 2 on the miniature: sixteen loads per thread, every value fetched four times' });
+    const tl = S.tl;
+    const cell = 24;
+    S.text({ x: 40, y: 30, text: 'global memory — every load is a trip of a few hundred cycles', size: 12, fill: K.grey, weight: 600 });
+    const A = S.matrix(Object.assign({ x: 40, y: 72, rows: 4, cols: 8, cell, values: Am, label: 'A  (4 × 8)', labelSize: 12 }, GMA));
+    const B = S.matrix(Object.assign({ x: 290, y: 72, rows: 8, cols: 4, cell, values: Bm, label: 'B  (8 × 4)', labelSize: 12 }, GMB));
+    S.text({ x: 480, y: 30, text: 'the block: 16 threads, one per cell of C', size: 12, fill: K.ink, weight: 600 });
+    const C = S.matrix({ x: 480, y: 72, rows: 4, cols: 4, cell, values: Cm, label: 'C  (4 × 4)', labelSize: 12, fill: '#fff', stroke: '#e0d9cf' });
+    C.allVals().forEach(v => v.setNow({ opacity: 0 }));
+    const thr = S.text({ x: 528, y: 190, text: 'thread (1, 2) owns C[1][2]', anchor: 'middle', size: 11, fill: K.C, weight: 600, opacity: 0 });
+    const frame = S.rect({ x: 480 + 2 * cell - 2, y: 72 + cell - 2, w: cell + 4, h: cell + 4, fill: 'none', stroke: K.C, sw: 2, rx: 3, opacity: 0 });
 
-    S.text({ x: 40, y: 28, text: 'One block computes one 32 × 32 tile of C. The drawing is 8 × 8; the real problem has 128 tiles along each edge.', size: 12.5, fill: K.ink, weight: 600 });
+    // the register and the product list for thread (1,2)
+    const regBox = S.rect({ x: 640, y: 60, w: 220, h: 50, fill: K.goldfill, stroke: K.gold, sw: 1.2, rx: 8, opacity: 0 });
+    const regLbl = S.text({ x: 750, y: 50, text: 'tmp — thread (1, 2)’s register', anchor: 'middle', size: 11, fill: K.muted, opacity: 0 });
+    const reg = S.counter({ x: 750, y: 86, value: 0, size: 22, anchor: 'middle', opacity: 0 });
+    const lines = [];
+    for (let k = 0; k < 8; k++) lines.push(S.text({ x: 640, y: 130 + k * 17, text: '', font: 'mono', size: 11, fill: K.ink, opacity: 0 }));
+    const rowA = Am[1], colB = Bm.map(r => r[2]);
+    const prods = rowA.map((a, k) => a * colB[k]);
+    const cum = []; prods.reduce((s, p, k) => { cum[k] = s + p; return s + p; }, 0);
 
-    const A = S.matrix(Object.assign({ x: 90, y: 78, label: 'A' }, base));
-    const B = S.matrix(Object.assign({ x: 350, y: 78, label: 'B' }, base));
-    const Cm = S.matrix(Object.assign({ x: 610, y: 78, label: 'C' }, base));
-    S.text({ x: 320, y: 178, text: '×', anchor: 'middle', size: 20, fill: K.muted });
-    S.text({ x: 580, y: 178, text: '=', anchor: 'middle', size: 20, fill: K.muted });
+    // counters
+    const cThr = S.counter({ x: 40, y: 296, label: 'global loads, thread (1, 2)', value: 0, size: 22, fill: K.grey });
+    const cBlk = S.counter({ x: 290, y: 296, label: 'global loads, the whole block', value: 0, size: 22, fill: K.grey, opacity: 0 });
+    const cNeed = S.counter({ x: 540, y: 296, label: 'distinct values the block needs', value: 0, size: 22, fill: K.ink, opacity: 0 });
+    const note1 = S.text({ x: 40, y: 372, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 394, text: '', size: 12, fill: K.muted });
+    const note3 = S.text({ x: 40, y: 430, text: '', size: 12.5, fill: K.red, weight: 600 });
+    const note4 = S.text({ x: 40, y: 452, text: '', size: 12, fill: K.muted });
 
-    const aSub = S.text({ x: 190, y: 298, text: 'one row = a 32 × 4,092 strip', anchor: 'middle', size: 11, fill: K.muted, opacity: 0 });
-    const bSub = S.text({ x: 450, y: 298, text: 'one column = a 4,092 × 32 strip', anchor: 'middle', size: 11, fill: K.muted, opacity: 0 });
-    const cSub = S.text({ x: 710, y: 298, text: 'one cell = one 32 × 32 tile = one block', anchor: 'middle', size: 11, fill: K.muted, opacity: 0 });
+    const pa = packet(S, 0, 0, '', K.Afill, K.A), pb = packet(S, 0, 0, '', K.Bfill, K.B);
+    const tripPk = [0, 1, 2, 3].map(() => packet(S, 0, 0, '', K.Afill, K.A));
 
-    const cNeed = S.counter({ x: 40, y: 338, label: 'distinct numbers this block needs', value: 0, size: 26, fill: K.A, opacity: 0 });
-    const cGot = S.counter({ x: 300, y: 338, label: 'values kernel 2’s block fetches', value: 0, size: 26, fill: K.red, opacity: 0 });
-    const cRat = S.counter({ x: 860, y: 338, label: 'so every one of them arrives', value: 0, size: 26, anchor: 'end', fill: K.red, opacity: 0, format: v => Math.round(v) + '× over' });
-
-    const line1 = S.text({ x: 40, y: 392, text: '', font: 'mono', size: 12, fill: K.accent });
-    const line2 = S.text({ x: 40, y: 412, text: '', font: 'mono', size: 12, fill: K.accent });
-
-    tl.step('Follow one block: the one computing the <b>top-left 32 × 32 tile</b> of C. One drawn cell of C is one such tile.');
-    tl.to(Cm.cellAt(0, 0), { fill: K.Cfill, stroke: K.C, sw: 1.8 }, 0.5);
-    tl.show(cSub, 0.4, { at: '<+0.2' });
-    tl.wait(1.6);
-
-    tl.step('Its 32 rows of output need <b>rows 0–31 of A</b> — every one of their 4,092 columns.');
-    tl.to(A.row(0), { fill: K.Afill, stroke: K.A, sw: 1 }, 0.25, { stagger: 0.05 });
-    tl.show(aSub, 0.4, { at: '<+0.2' });
-    tl.wait(1.6);
-
-    tl.step('Its 32 columns need <b>columns 0–31 of B</b>, all 4,092 rows. Nothing else in either matrix can change this block’s answers.');
-    tl.to(B.col(0), { fill: K.Bfill, stroke: K.B, sw: 1 }, 0.25, { stagger: 0.05 });
-    tl.show(bSub, 0.4, { at: '<+0.2' });
-    tl.wait(1.8);
-
-    tl.step('Count them: <b>2 × 32 × 4,092 = 261,888</b> distinct numbers. That is the whole of what this block will ever need.');
-    tl.show(cNeed, 0.3);
-    tl.to(cNeed.num, { value: 261888 }, 1.0, { at: '<' });
-    tl.set(line1, { text: 'needs · 2 × 32 × 4,092 = 261,888 distinct numbers' }, '<+0.4');
-    tl.wait(2.0);
-
-    tl.step('Kernel 2’s block fetches <b>1,024 threads × 4,092 k-steps × 2 loads = 8,380,416</b> values. Every number it needs, it drags in <b>32 times</b>.');
-    tl.show(cGot, 0.3);
-    tl.to(cGot.num, { value: 8380416 }, 1.2, { at: '<' });
-    tl.set(line2, { text: 'fetches · 1,024 × 4,092 × 2 = 8,380,416 · and 8,380,416 ÷ 261,888 = 32' }, '<+0.4');
-    tl.show(cRat, 0.3, { at: '<+0.4' });
-    tl.to(cRat.num, { value: 32 }, 0.6, { at: '<' });
-    tl.wait(3.0);
-    S.finish();
-  })();
-
-  // ------------------------------------------------------------ 6.2 where the 32 comes from
-  (function () {
-    const S = MB.scene('a-redundancy', { w: 900, h: 492, title: 'Why every value of A and B is fetched 32 times inside one block' });
-    const tl = S.tl, c = 6;
-    const g = { rows: 32, cols: 32, cell: c, fill: '#f7f6f2', stroke: '#ddd9cf', sw: 0.5, labelSize: 11.5 };
-
-    S.text({ x: 40, y: 28, text: 'One block: 32 × 32 threads, one per output. Here are the first 32 × 32 of A and of B beside them.', size: 12.5, fill: K.ink, weight: 600 });
-    S.text({ x: 40, y: 48, text: 'Each small square on the right is one thread of the block.', size: 11, fill: K.muted });
-
-    const A = S.matrix(Object.assign({ x: 60, y: 116, label: 'A  —  rows 0–31, columns 0–31' }, g));
-    const B = S.matrix(Object.assign({ x: 330, y: 116, label: 'B  —  rows 0–31, columns 0–31' }, g));
-    const T = S.matrix(Object.assign({ x: 600, y: 116, label: 'the block’s 32 × 32 threads' }, g));
-
-    const aNote = S.text({ x: 156, y: 326, text: '', anchor: 'middle', size: 11, fill: K.A, weight: 600 });
-    const bNote = S.text({ x: 426, y: 326, text: '', anchor: 'middle', size: 11, fill: K.B, weight: 600 });
-    const tNote = S.text({ x: 696, y: 326, text: '', anchor: 'middle', size: 11, fill: K.muted });
-
-    const cA = S.counter({ x: 60, y: 352, label: 'trips to global memory for A[0][7]', value: 0, size: 24, fill: K.red });
-    const cB = S.counter({ x: 400, y: 352, label: 'trips to global memory for B[3][9]', value: 0, size: 24, fill: K.red });
-
-    const verdict = S.text({ x: 40, y: 412, text: '', size: 13, fill: K.ink, weight: 600 });
-    const regLine = S.text({ x: 40, y: 448, text: '', size: 12, fill: K.muted });
-    const regLine2 = S.text({ x: 40, y: 468, text: '', size: 12, fill: K.muted });
-    const sm = S.membox({ x: 520, y: 434, w: 340, h: 46, fill: K.purplefill, stroke: K.purple, rx: 8, labelPos: 'center', labelSize: 12, label: 'shared memory — 48 KB on the SM', labelFill: K.purple, opacity: 0 });
-
-    // rings so the single highlighted cell is findable at this size
-    const aRing = S.rect({ x: A.corner(0, 7)[0] - 4, y: A.corner(0, 7)[1] - 4, w: c + 8, h: c + 8, fill: 'none', stroke: K.Adeep, sw: 1.6, rx: 2, opacity: 0 })
-      .pivot(A.corner(0, 7)[0] + c / 2, A.corner(0, 7)[1] + c / 2);
-    const bRing = S.rect({ x: B.corner(3, 9)[0] - 4, y: B.corner(3, 9)[1] - 4, w: c + 8, h: c + 8, fill: 'none', stroke: K.Bdeep, sw: 1.6, rx: 2, opacity: 0 })
-      .pivot(B.corner(3, 9)[0] + c / 2, B.corner(3, 9)[1] + c / 2);
-    const aLead = S.line({ x1: A.center(0, 7)[0], y1: A.center(0, 7)[1] + 8, x2: 156, y2: 316, stroke: K.A, sw: 0.8, dash: '3 3', opacity: 0 });
-    const bLead = S.line({ x1: B.center(3, 9)[0], y1: B.center(3, 9)[1] + 8, x2: 426, y2: 316, stroke: K.B, sw: 0.8, dash: '3 3', opacity: 0 });
-
-    // dots that fly from a value to the threads that want it
-    const aDots = [], bDots = [];
-    for (let i = 0; i < 32; i++) {
-      const [ax, ay] = A.center(0, 7);
-      aDots.push(S.circle({ cx: 0, cy: 0, r: 2.4, fill: K.A, opacity: 0, tx: ax, ty: ay }));
-      const [bx, by] = B.center(3, 9);
-      bDots.push(S.circle({ cx: 0, cy: 0, r: 2.4, fill: K.B, opacity: 0, tx: bx, ty: by }));
-    }
-
-    tl.step('Take one number out of A: <b>A[0][7]</b>. It is loaded once by kernel 2’s block, and then loaded again, and again.');
-    tl.to(A.cellAt(0, 7), { fill: K.A, stroke: K.Adeep, sw: 1.2 }, 0.5);
-    tl.show([aRing, aLead], 0.35, { at: '<' });
-    tl.pulse(aRing, 1.9, 0.7);
-    tl.pulse(aRing, 1.9, 0.7);
-    tl.set(aNote, { text: 'A[0][7]' }, '<+0.2');
+    tl.step('Kernel 2 on the miniature. Sixteen threads, one per cell of C. Follow <b>thread (1, 2)</b>: it owns C[1][2], so it needs row 1 of A and column 2 of B.');
+    tl.show([thr, frame], 0.4);
+    tl.to(C.cellAt(1, 2), { fill: K.Cfill, stroke: K.C }, 0.4, { at: '<' });
+    tl.to(A.row(1), HOT_A, 0.3, { stagger: 0.05 });
+    tl.to(B.col(2), HOT_B, 0.3, { at: '<', stagger: 0.05 });
+    tl.show([regBox, regLbl, reg], 0.4);
     tl.wait(1.4);
 
-    tl.step('Which threads want it? Every thread whose output is in <b>row 0</b> of the tile — they all walk row 0 of A. Thirty-two threads, thirty-two separate loads.');
-    tl.to(T.row(0), { fill: K.Cfill, stroke: K.C, sw: 0.9 }, 0.2, { stagger: 0.02 });
-    tl.show(aDots, 0.1, { stagger: 0.02 });
-    aDots.forEach((d, i) => { const [x, y] = T.center(0, i); tl.move(d, x, y, 0.75, { at: i === 0 ? '<' : '<+0.02', arc: -26 }); });
-    tl.hide(aDots, 0.25);
-    tl.to(cA.num, { value: 32 }, 0.6, { at: '<' });
-    tl.set(tNote, { text: 'row 0 of the tile: 32 threads' }, '<');
-    tl.wait(1.8);
+    function stepK(k, dur) {
+      const [ax, ay] = A.center(1, k), [bx, by] = B.center(k, 2);
+      tl.set(pa.g, { tx: ax, ty: ay }); tl.set(pa.t, { text: rowA[k] }, '<');
+      tl.set(pb.g, { tx: bx, ty: by }, '<'); tl.set(pb.t, { text: colB[k] }, '<');
+      tl.to([A.cellAt(1, k), B.cellAt(k, 2)], { sw: 2.4 }, 0.15, { at: '<' });
+      tl.show([pa.g, pb.g], 0.12, { at: '<' });
+      tl.move(pa.g, 700, 130 + k * 17, dur, { at: '<', arc: -50 });
+      tl.move(pb.g, 720, 130 + k * 17, dur, { at: '<', arc: 40 });
+      tl.to(cThr.num, { value: 2 * (k + 1) }, dur, { at: '<', ease: 'linear' });
+      tl.hide([pa.g, pb.g], 0.12);
+      tl.set(lines[k], { text: `k=${k}:  ${rowA[k]} × ${colB[k]} = ${String(prods[k]).padStart(2)}    tmp = ${cum[k]}` }, '<');
+      tl.show(lines[k], 0.15, { at: '<' });
+      tl.to(reg.num, { value: cum[k] }, 0.3, { at: '<' });
+      tl.to([A.cellAt(1, k), B.cellAt(k, 2)], { sw: 1.4 }, 0.3, { at: '<' });
+    }
+    tl.step('k = 0: it loads <b>A[1][0]</b> and <b>B[0][2]</b> from global memory — two slow trips — multiplies them, and adds 1 × 1 into <code>tmp</code>.');
+    stepK(0, 0.8);
+    tl.wait(1.2);
+    tl.step('k = 1 to 7: the same thing, seven more times. Sixteen loads from global memory for eight multiply-adds, and <code>tmp</code> ends on 171, which is C[1][2].');
+    for (let k = 1; k < 8; k++) { stepK(k, 0.4); tl.wait(0.1); }
+    tl.show(C.valAt(1, 2), 0.3);
+    tl.wait(1.6);
 
-    tl.step('B is the same picture with the axes swapped. <b>B[3][9]</b> is wanted by the 32 threads in <b>column 9</b>, one per row, and each of them fetches it too.');
-    tl.to(B.cellAt(3, 9), { fill: K.B, stroke: K.Bdeep, sw: 1.2 }, 0.4);
-    tl.show([bRing, bLead], 0.35, { at: '<' });
-    tl.pulse(bRing, 1.9, 0.7);
-    tl.set(bNote, { text: 'B[3][9]' }, '<');
-    tl.to(T.col(9), { fill: K.Cfill, stroke: K.C, sw: 0.9 }, 0.2, { stagger: 0.02 });
-    tl.show(bDots, 0.1, { stagger: 0.02 });
-    bDots.forEach((d, i) => { const [x, y] = T.center(i, 9); tl.move(d, x, y, 0.75, { at: i === 0 ? '<' : '<+0.02', arc: 26 }); });
-    tl.hide(bDots, 0.25);
-    tl.to(cB.num, { value: 32 }, 0.6, { at: '<' });
-    tl.set(tNote, { text: 'row 0 and column 9: 32 threads each' }, '<');
-    tl.wait(1.8);
+    tl.step('Now the other three threads in row 1 of the tile. They own C[1][0], C[1][1] and C[1][3], so they walk the <b>same row 1 of A</b> — and each of them fetches every value of it on its own.');
+    tl.to([C.cellAt(1, 0), C.cellAt(1, 1), C.cellAt(1, 3)], { fill: '#fdf0e3', stroke: K.C }, 0.4);
+    tl.to(A.cellAt(1, 3), { fill: '#b9d0f7', sw: 2.4 }, 0.3);
+    tl.set(note1, { text: 'A[1][3] = 8 is wanted by four threads: (1, 0), (1, 1), (1, 2), (1, 3)' }, '<');
+    const [sx, sy] = A.center(1, 3);
+    for (let j = 0; j < 4; j++) {
+      const [tx, ty] = C.center(1, j);
+      tl.set(tripPk[j].g, { tx: sx, ty: sy }); tl.set(tripPk[j].t, { text: 8 }, '<');
+      tl.show(tripPk[j].g, 0.1, { at: '<' });
+      tl.move(tripPk[j].g, tx, ty, 0.55, { at: '<', arc: -30 - 12 * j });
+      tl.set(note2, { text: `trips to global memory for this one value: ${j + 1}` }, '<+0.4');
+      tl.hide(tripPk[j].g, 0.12);
+    }
+    tl.set(note2, { text: 'four separate trips to global memory for the same number — and the same for every value of A and B' });
+    tl.wait(2.0);
 
-    tl.step('The tile has 32 rows and 32 columns, so <b>every value is fetched 32 times</b>. The fix writes itself: fetch each value once, and put it where all 32 can reach it.');
-    tl.set(verdict, { text: 'fetch it once — then let all 32 threads read that one copy' });
-    tl.wait(2.2);
-
-    tl.step('A register can’t hold it: a register belongs to one thread, which is what made it free. <b>Shared memory</b> can — a scratchpad on the SM that every thread of the block can read.');
-    tl.set(regLine, { text: 'a register is private to one thread   ·   reading it is free   ·   nobody else can see it' });
-    tl.set(regLine2, { text: 'shared memory is visible to all 1,024 threads of the block   ·   about 20–30 cycles to read' }, '<+0.4');
-    tl.show(sm, 0.5, { at: '<+0.4' });
+    tl.step('The count for the block: 16 threads × 8 steps × 2 loads = <b>256 loads</b>, for <b>64 distinct values</b>. Every number, four times over. At full size it is 8,380,416 loads for 261,888 values: thirty-two times over.');
+    tl.show([cBlk, cNeed], 0.3);
+    tl.to(cBlk.num, { value: 256 }, 1.0, { at: '<', ease: 'linear' });
+    tl.to(cNeed.num, { value: 64 }, 1.0, { at: '<', ease: 'linear' });
+    tl.to(A.all(), HOT_A, 0.4, { at: '<+0.3', stagger: 0.01 });
+    tl.to(B.all(), HOT_B, 0.4, { at: '<', stagger: 0.01 });
+    tl.set(note3, { text: '256 ÷ 64 = 4 — the tile’s edge length. In the real kernel the edge is 32.' }, '<+0.4');
+    tl.set(note4, { text: 'the fix: fetch each value once, and put it where all four threads can reach it' }, '<+0.5');
     tl.wait(3.0);
     S.finish();
   })();
 
-  // ------------------------------------------------------------ 6.3 it doesn't fit, so chop k
+  // ------------------------------------------------------------ 6.2 the idea: fetch once, read four times
+  (function () {
+    const S = MB.scene('a-idea', { w: 900, h: 430, title: 'One value, four threads: four slow trips in kernel 2 against one slow trip and four fast reads in kernel 3' });
+    const tl = S.tl;
+    function panel(x, title, withSmem) {
+      S.text({ x: x + 195, y: 30, text: title, anchor: 'middle', size: 13.5, fill: K.ink, weight: 600 });
+      const th = S.threads({ x: x + 55, y: 62, n: 4, size: 44, gap: 34, fill: '#f3f0e8', stroke: '#b9b4a8', rx: 6 });
+      ['(1, 0)', '(1, 1)', '(1, 2)', '(1, 3)'].forEach((s, i) => S.text({ x: th.center(i)[0], y: th.center(i)[1] + 34, text: s, anchor: 'middle', size: 10.5, fill: K.muted }));
+      S.text({ x: x + 195, y: 148, text: 'the four threads of tile row 1, each with its own register', anchor: 'middle', size: 10.5, fill: K.faint });
+      let smem = null;
+      if (withSmem) smem = S.membox({ x: x + 40, y: 200, w: 310, h: 54, label: 'shared memory · on the SM · ~25 cycles away', labelPos: 'bottom', labelSize: 10.5, fill: K.purplefill, stroke: K.purple, rx: 8 });
+      const gm = S.membox({ x: x + 40, y: 300, w: 310, h: 60, label: 'global memory · ~500 cycles away', labelPos: 'bottom', labelSize: 10.5, fill: K.greyfill, stroke: K.grey, rx: 8 });
+      const val = S.rect({ x: x + 175, y: 306, w: 40, h: 24, fill: K.Afill, stroke: K.A, sw: 1.2, rx: 3 });
+      S.text({ x: x + 195, y: 318, text: '8', anchor: 'middle', size: 12, fill: K.ink, weight: 600 });
+      S.text({ x: x + 195, y: 292, text: 'A[1][3]', anchor: 'middle', size: 10.5, fill: K.A, weight: 600 });
+      const cyc = S.counter({ x: x + 40, y: 398, label: 'cycles spent waiting (rough)', value: 0, size: 16, fill: K.ink });
+      const trips = S.text({ x: x + 350, y: 404, text: '', anchor: 'end', size: 11.5, fill: K.accent, weight: 600 });
+      return { x, th, smem, gm, cyc, trips };
+    }
+    const L = panel(40, 'kernel 2: every thread fetches it', false);
+    const R = panel(470, 'kernel 3: fetch once, then read from shared memory', true);
+    const lp = [0, 1, 2, 3].map(() => packet(S, 0, 0, '8', K.Afill, K.A, 18));
+    const rp0 = packet(S, 0, 0, '8', K.Afill, K.A, 18);
+    const rp = [0, 1, 2, 3].map(() => packet(S, 0, 0, '8', K.Afill, K.A, 18));
+    const smemSlot = S.rect({ x: 470 + 175, y: 208, w: 40, h: 24, fill: '#fff', stroke: K.purple, sw: 1, rx: 3, opacity: 0.6 });
+    const smemVal = S.text({ x: 470 + 195, y: 220, text: '8', anchor: 'middle', size: 12, fill: K.ink, weight: 600, opacity: 0 });
+
+    tl.step('One value of A, A[1][3] = 8, and the four threads of tile row 1 that all need it. Both kernels have to get it from global memory into four registers.');
+    tl.wait(1.6);
+
+    tl.step('<b>Kernel 2:</b> each thread makes its own trip. Four trips, a few hundred cycles each, for one number.');
+    for (let j = 0; j < 4; j++) {
+      const [tx, ty] = L.th.center(j);
+      tl.set(lp[j].g, { tx: 40 + 195, ty: 318 });
+      tl.show(lp[j].g, 0.1);
+      tl.move(lp[j].g, tx, ty, 0.7, { at: '<', arc: 0 });
+      tl.to(L.cyc.num, { value: 500 * (j + 1) }, 0.7, { at: '<', ease: 'linear' });
+      tl.to(L.th.items[j], { fill: K.Afill, stroke: K.A }, 0.2);
+      tl.hide(lp[j].g, 0.1, { at: '<' });
+      tl.set(L.trips, { text: `${j + 1} trip${j ? 's' : ''} to global memory` }, '<');
+    }
+    tl.wait(1.4);
+
+    tl.step('<b>Kernel 3:</b> one thread fetches it from global memory into shared memory. One slow trip.');
+    tl.set(rp0.g, { tx: 470 + 195, ty: 318 });
+    tl.show(rp0.g, 0.1);
+    tl.move(rp0.g, 470 + 195, 220, 0.7, { at: '<' });
+    tl.to(R.cyc.num, { value: 500 }, 0.7, { at: '<', ease: 'linear' });
+    tl.hide(rp0.g, 0.1);
+    tl.to(smemSlot, { opacity: 1, fill: K.Afill, stroke: K.A }, 0.2, { at: '<' });
+    tl.show(smemVal, 0.2, { at: '<' });
+    tl.set(R.trips, { text: '1 trip to global memory' }, '<');
+    tl.wait(1.2);
+
+    tl.step('Then all four threads read it out of shared memory. Four reads, about 25 cycles each, and no trip to DRAM at all.');
+    for (let j = 0; j < 4; j++) {
+      const [tx, ty] = R.th.center(j);
+      tl.set(rp[j].g, { tx: 470 + 195, ty: 220 });
+      tl.show(rp[j].g, 0.08);
+      tl.move(rp[j].g, tx, ty, 0.3, { at: '<' });
+      tl.to(R.cyc.num, { value: 500 + 25 * (j + 1) }, 0.3, { at: '<', ease: 'linear' });
+      tl.to(R.th.items[j], { fill: K.Afill, stroke: K.A }, 0.15);
+      tl.hide(rp[j].g, 0.08, { at: '<' });
+    }
+    tl.set(R.trips, { text: '1 trip + 4 fast reads' });
+    tl.wait(1.6);
+
+    tl.step('One slow trip plus four fast reads, instead of four slow trips. In the real kernel a tile row has 32 threads, so it is one trip instead of 32 — for every value of A and B.');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 6.3 why we can't preload everything
   (function () {
     const S = MB.scene('a-fit', { w: 900, h: 412, title: 'The two strips against the 48 KB shared-memory budget, and the chunk that fits' });
     const tl = S.tl;
@@ -346,16 +393,13 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
     const budget = S.rect({ x: X, y: 178, w: kb48, h: 24, fill: K.purplefill, stroke: K.purple, sw: 1.2, rx: 3, opacity: 0 });
     const budgetL = S.text({ x: X + kb48 + 10, y: 190, text: 'the whole 48 KB shared-memory budget for one block, at the same scale', size: 12, fill: K.purple, weight: 600, opacity: 0 });
     const over = S.text({ x: X, y: 226, text: '', size: 13, fill: K.red, weight: 600 });
-
     const acc = S.text({ x: 40, y: 262, text: '', size: 12.5, fill: K.ink });
 
-    // chunk markers on the two bars
     const mA = S.rect({ x: X, y: 88, w: W / 128, h: 32, fill: 'none', stroke: K.accent, sw: 1.6, rx: 1, opacity: 0 });
     const mB = S.rect({ x: X, y: 124, w: W / 128, h: 32, fill: 'none', stroke: K.accent, sw: 1.6, rx: 1, opacity: 0 });
     const ticks = [];
     for (let i = 1; i < 128; i++) ticks.push(S.line({ x1: X + i * W / 128, y1: 92, x2: X + i * W / 128, y2: 116, stroke: K.Adeep, sw: 0.35, opacity: 0 }));
 
-    // the enlarged budget
     const EX = 150, EW = 560, EY = 306;
     const encl = S.text({ x: 40, y: 296, text: '', size: 11.5, fill: K.purple, weight: 600 });
     const ebox = S.rect({ x: EX, y: EY, w: EW, h: 40, fill: K.purplefill, stroke: K.purple, sw: 1.2, rx: 4, opacity: 0 });
@@ -392,199 +436,284 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
     tl.set(eNote, { text: '8 KB of 48 KB. It fits comfortably.' }, '<+0.3');
     tl.wait(2.2);
 
-    tl.step('4,092 ÷ 32 = 127.9, so there are <b>128 chunks</b>, the last one partial. Hold one pair, add its 32 products into the total, throw it away, load the next.');
+    tl.step('4,092 ÷ 32 = 127.9, so there are <b>128 chunks</b>, the last one partial. Hold one pair, add its 32 products into the total, throw it away, load the next. In the miniature: two chunks of four.');
     tl.set(eSub, { text: 'As — one 32 × 32 chunk of A, 4 KB  ·  Bs — one 32 × 32 chunk of B, 4 KB  ·  128 pairs, one at a time' });
     tl.set(fin, { text: '128 chunks  ·  one pair resident at a time  ·  the running total never leaves its register' }, '<+0.4');
     tl.wait(3.0);
     S.finish();
   })();
 
-  // ------------------------------------------------------------ 6.4 one chunk, start to finish
+  // ------------------------------------------------------------ 6.4 kernel 3, every step (the centerpiece)
   (function () {
-    const S = MB.scene('a-chunk', { w: 900, h: 580, title: 'One chunk of kernel 3, from thread (5, 9)’s point of view' });
+    const S = MB.scene('a-k3', { w: 900, h: 660, title: 'Kernel 3 on the miniature: two chunks, sixteen threads, every load, every barrier and every multiply' });
     const tl = S.tl;
+    const cell = 22;
 
-    // --- the real dot product, generated and summed here
-    const rA = MB.rng(11), rB = MB.rng(12);
-    const av = Array.from({ length: 4092 }, () => 1 + Math.floor(rA() * 9));
-    const bv = Array.from({ length: 4092 }, () => 1 + Math.floor(rB() * 9));
-    const cum = []; let acc = 0;
-    for (let ch = 0; ch < 128; ch++) {
-      let s = 0;
-      for (let d = 0; d < 32; d++) { const i = 32 * ch + d; if (i < 4092) s += av[i] * bv[i]; }
-      acc += s; cum.push(acc);
-    }
-    const TOTAL = acc;
+    // ---- global memory: A and B with the chunk windows
+    S.text({ x: 40, y: 26, text: 'global memory', size: 12, fill: K.grey, weight: 600 });
+    const A = S.matrix(Object.assign({ x: 40, y: 64, rows: 4, cols: 8, cell, values: Am, label: 'A  (4 × 8)', labelSize: 12 }, GMA));
+    const B = S.matrix(Object.assign({ x: 250, y: 64, rows: 8, cols: 4, cell, values: Bm, label: 'B  (8 × 4)', labelSize: 12 }, GMB));
+    const winA = S.rect({ x: 38, y: 62, w: 4 * cell + 4, h: 4 * cell + 4, fill: 'none', stroke: K.accent, sw: 2, rx: 2, opacity: 0 });
+    const winB = S.rect({ x: 248, y: 62, w: 4 * cell + 4, h: 4 * cell + 4, fill: 'none', stroke: K.accent, sw: 2, rx: 2, opacity: 0 });
+    const winLblA = S.text({ x: 40, y: 168, text: '', size: 10.5, fill: K.accent, weight: 600 });
+    const winLblB = S.text({ x: 250, y: 258, text: '', size: 10.5, fill: K.accent, weight: 600 });
 
-    // --- top band
-    S.text({ x: 40, y: 28, text: 'One chunk, seen from thread (5, 9) — the thread that owns C[5][9] of this block’s tile.', size: 13, fill: K.ink, weight: 600 });
-    S.text({ x: 40, y: 48, text: 'The other 1,023 threads are doing exactly the same thing with their own row and column, at the same moment.', size: 11, fill: K.muted });
+    // ---- shared memory
+    const SM = S.membox({ x: 380, y: 40, w: 270, h: 232, label: 'shared memory — on the SM, visible to all 16 threads', labelPos: 'bottom', labelSize: 10.5, fill: K.purplefill, stroke: K.purple, rx: 10 });
+    const As = S.matrix({ x: 404, y: 84, rows: 4, cols: 4, cell, values: Am.map(r => r.slice(0, 4)), label: 'As', labelSize: 12, fill: '#fff', stroke: '#d9d2ea' });
+    const Bs = S.matrix({ x: 538, y: 84, rows: 4, cols: 4, cell, values: Bm.slice(0, 4), label: 'Bs', labelSize: 12, fill: '#fff', stroke: '#d9d2ea' });
+    As.allVals().forEach(v => v.setNow({ opacity: 0 })); Bs.allVals().forEach(v => v.setNow({ opacity: 0 }));
+    const barLine = S.line({ x1: 392, y1: 214, x2: 638, y2: 214, stroke: K.accent, sw: 2.5, dash: '6 4', opacity: 0 });
+    const barLbl = S.text({ x: 515, y: 232, text: '__syncthreads()', anchor: 'middle', font: 'mono', size: 11, fill: K.accent, weight: 600, opacity: 0 });
 
-    const cChunk = S.counter({ x: 40, y: 80, label: 'chunks done', value: 0, size: 22, format: v => Math.round(v) + ' of 128' });
-    const cLoads = S.counter({ x: 190, y: 80, label: 'global loads, this block', value: 0, size: 22, fill: K.grey });
-    const cSmem = S.counter({ x: 400, y: 80, label: 'shared-memory reads', value: 0, size: 22, fill: K.purple });
+    // ---- the threads' registers and C
+    S.text({ x: 690, y: 26, text: '16 threads · thread (r, c) owns C[r][c]', size: 11.5, fill: K.ink, weight: 600 });
+    const zeros = [0, 1, 2, 3].map(() => [0, 0, 0, 0]);
+    const T = S.matrix({ x: 700, y: 64, rows: 4, cols: 4, cell, values: zeros, label: 'tmp — one register per thread', labelSize: 11, fill: K.goldfill, stroke: K.gold });
+    const tFrame = S.rect({ x: 700 + 2 * cell - 2, y: 64 + cell - 2, w: cell + 4, h: cell + 4, fill: 'none', stroke: K.C, sw: 2.2, rx: 3 });
+    S.text({ x: 744, y: 166, text: 'framed: thread (1, 2)', anchor: 'middle', size: 10.5, fill: K.C, weight: 600 });
+    const C = S.matrix({ x: 700, y: 196, rows: 4, cols: 4, cell, values: Cm, label: 'C  (4 × 4)', labelSize: 12, fill: '#fff', stroke: '#e0d9cf' });
+    C.allVals().forEach(v => v.setNow({ opacity: 0 }));
 
-    S.rect({ x: 610, y: 44, w: 240, h: 58, fill: K.goldfill, stroke: K.gold, sw: 1.2, rx: 8 });
-    S.text({ x: 730, y: 32, text: 'tmp — the running total, in a register', anchor: 'middle', size: 11, fill: K.muted });
-    const tmpNum = S.counter({ x: 730, y: 76, value: 0, size: 26, anchor: 'middle', fill: K.ink });
+    // ---- code panel (the kernel with BLOCKSIZE = 4)
+    const code = S.code({ x: 40, y: 318, w: 470, title: 'kernel 3 with BLOCKSIZE = 4 — thread (r, c)', lines: [
+      'float tmp = 0.0;                  // one register per thread',
+      'for (bk = 0; bk < K; bk += 4) {   // K = 8: two chunks',
+      '    As[r][c] = A[r][bk + c];      // copy ONE element of A',
+      '    Bs[r][c] = B[bk + r][c];      // ... and ONE element of B',
+      '    __syncthreads();              // wait for all 16 copies',
+      '    for (d = 0; d < 4; ++d)',
+      '        tmp += As[r][d] * Bs[d][c];   // from shared memory',
+      '    __syncthreads();              // wait for all 16 to finish reading',
+      '}',
+      'C[r][c] = tmp;',
+    ] });
 
-    // --- shared memory band
-    S.text({ x: 40, y: 124, text: 'shared memory — 8 KB on the SM, and every thread of the block can read it', size: 12.5, fill: K.purple, weight: 600 });
-    S.rect({ x: 40, y: 134, w: 820, h: 204, fill: K.purplefill, stroke: K.purple, sw: 1.2, rx: 10 });
-
-    const smOpt = { rows: 32, cols: 32, cell: 5, fill: K.white, stroke: '#e2ded4', sw: 0.4, labelSize: 11 };
-    const As = S.matrix(Object.assign({ x: 76, y: 168, label: 'As — one 32 × 32 chunk of A' }, smOpt));
-    const Bs = S.matrix(Object.assign({ x: 300, y: 168, label: 'Bs — one 32 × 32 chunk of B' }, smOpt));
-
-    const r1 = S.text({ x: 500, y: 180, text: '', size: 12, fill: K.ink, weight: 600 });
-    const r2 = S.text({ x: 500, y: 204, text: '', font: 'mono', size: 11.5, fill: K.A });
-    const r3 = S.text({ x: 500, y: 226, text: '', font: 'mono', size: 11.5, fill: K.B });
-    const r4 = S.text({ x: 500, y: 254, text: '', size: 11.5, fill: K.ink });
-    const r5 = S.text({ x: 500, y: 280, text: '', size: 11.5, fill: K.muted });
-    const r6 = S.text({ x: 500, y: 304, text: '', size: 11.5, fill: K.muted });
-
-    // --- the barrier
-    const barLine = S.line({ x1: 40, y1: 352, x2: 860, y2: 352, stroke: K.accent, sw: 1.8, dash: '7 5', opacity: 0 });
-    const barLbl = S.text({ x: 450, y: 368, text: '', anchor: 'middle', size: 11.5, fill: K.accent, weight: 600 });
-
-    // --- global memory band
-    S.text({ x: 40, y: 386, text: 'global memory — the two strips this block reads, 32 columns at a time', size: 12.5, fill: K.grey, weight: 600 });
-    S.rect({ x: 40, y: 394, w: 820, h: 162, fill: '#f7f6f2', stroke: K.grey, sw: 1, rx: 10 });
-
-    const gOpt = { cell: 4, fill: '#e6e3da', stroke: '#d3cfc5', sw: 0.35, labelSize: 10.5 };
-    const gA = S.matrix(Object.assign({ x: 80, y: 430, rows: 8, cols: 32, label: 'A — 32 rows × 128 of 4,092 columns' }, gOpt));
-    const gB = S.matrix(Object.assign({ x: 330, y: 416, rows: 32, cols: 8, label: 'B — 128 of 4,092 rows × 32 columns' }, gOpt));
-    S.text({ x: 216, y: 446, text: '…', size: 12, fill: K.faint });
-    S.text({ x: 348, y: 550, text: '…', anchor: 'middle', size: 12, fill: K.faint });
-
-    const winA = S.rect({ x: 0, y: 0, w: 32, h: 32, fill: 'none', stroke: K.accent, sw: 1.8, rx: 1, tx: 80, ty: 430 });
-    const winB = S.rect({ x: 0, y: 0, w: 32, h: 32, fill: 'none', stroke: K.accent, sw: 1.8, rx: 1, tx: 330, ty: 416 });
-
-    const g1 = S.text({ x: 440, y: 424, text: '', size: 11.5, fill: K.ink });
-    const g2 = S.text({ x: 440, y: 446, text: '', size: 11.5, fill: K.muted });
-    const g3 = S.text({ x: 440, y: 472, text: '', size: 11.5, fill: K.ink, weight: 600 });
-    const g4 = S.text({ x: 440, y: 502, text: '', size: 11.5, fill: K.muted });
-
-    // packets that carry a chunk up into shared memory
-    const aFly = S.tile({ x: 80, y: 430, rows: 8, cols: 8, cell: 3.6, gap: 0.4, fill: K.Afill, stroke: K.A, sw: 0.4, frameFill: '#fff', frameStroke: K.A, opacity: 0 });
-    const bFly = S.tile({ x: 330, y: 416, rows: 8, cols: 8, cell: 3.6, gap: 0.4, fill: K.Bfill, stroke: K.B, sw: 0.4, frameFill: '#fff', frameStroke: K.B, opacity: 0 });
-
-    const asCells = As.all(), bsCells = Bs.all();
-    const asRest = asCells.filter(p => p.r !== 5), bsRest = bsCells.filter(p => p.c !== 9);
-    const FILL_A = { fill: K.Afill, stroke: K.A };
-    const FILL_B = { fill: K.Bfill, stroke: K.B };
-    const EMPTY = { fill: K.white, stroke: '#e2ded4' };
-
-    // copy chunk `ch` up from global memory into As and Bs
-    function loadChunk(ch, dur, stag) {
-      tl.set(aFly, { tx: 80 + ch * 32, ty: 430 });
-      tl.set(bFly, { tx: 330, ty: 416 + ch * 32 }, '<');
-      tl.to(gA.block(0, ch * 8, 8, 8), FILL_A, 0.25, { at: '<', stagger: 0.0015 });
-      tl.to(gB.block(ch * 8, 0, 8, 8), FILL_B, 0.25, { at: '<', stagger: 0.0015 });
-      tl.show([aFly, bFly], 0.12);
-      tl.move(aFly, 141, 233, dur, { at: '<', arc: -70 });
-      tl.move(bFly, 365, 233, dur, { at: '<', arc: 70 });
-      tl.to([aFly, bFly], { opacity: 0, scale: 0.3 }, 0.25);
-      tl.to(asCells, FILL_A, 0.16, { at: '<-0.1', stagger: stag });
-      tl.to(bsCells, FILL_B, 0.16, { at: '<', stagger: stag });
-      tl.to([aFly, bFly], { scale: 1 }, 0.01);
-    }
-    // the row and column this one thread reads out of the chunk
-    function readRowCol(dur) {
-      tl.to(As.row(5), { fill: K.A, stroke: K.Adeep, sw: 0.8 }, dur, { stagger: dur / 60 });
-      tl.to(Bs.col(9), { fill: K.B, stroke: K.Bdeep, sw: 0.8 }, dur, { at: '<', stagger: dur / 60 });
+    // ---- worksheet for thread (1,2)
+    const wsX = 540;
+    S.rect({ x: wsX, y: 318, w: 320, h: 185, fill: '#fff', stroke: K.rule, sw: 1, rx: 8 });
+    S.text({ x: wsX + 12, y: 336, text: 'thread (1, 2):  tmp += As[1][d] × Bs[d][2]', font: 'mono', size: 11, fill: K.ink, weight: 600 });
+    const rowA = Am[1], colB = Bm.map(r => r[2]);
+    const prods = rowA.map((a, k) => a * colB[k]);
+    const cum = []; prods.reduce((s, p, k) => { cum[k] = s + p; return s + p; }, 0);
+    const ws = [];
+    for (let k = 0; k < 8; k++) {
+      const chunk = k < 4 ? 0 : 1, d = k % 4;
+      ws.push(S.text({ x: wsX + 12, y: 358 + k * 17, font: 'mono', size: 10.5, fill: K.ink, opacity: 0,
+        text: `chunk ${chunk}  d=${d}   ${rowA[k]} × ${colB[k]} = ${String(prods[k]).padStart(2)}   tmp = ${cum[k]}` }));
     }
 
-    // ---- step 1: the cooperative load
-    tl.step('<b>Chunk 0.</b> Each of the 1,024 threads copies one element of A and one of B into shared memory — 2,048 global loads for the whole block, and they are coalesced.');
-    tl.set(g1, { text: 'each of the 1,024 threads copies one element of A and one of B' });
-    tl.set(g2, { text: 'neighboring threads copy neighboring addresses — the copy is coalesced' }, '<+0.3');
-    loadChunk(0, 0.9, 0.0007);
-    tl.to(cLoads.num, { value: 2048 }, 0.6, { at: '<+0.3' });
-    tl.set(g3, { text: '2,048 global loads for the whole chunk' }, '<');
-    tl.wait(1.8);
+    // ---- counters
+    const cG = S.counter({ x: 40, y: 545, label: 'loads from global memory (whole block)', value: 0, size: 22, fill: K.grey });
+    const cS = S.counter({ x: 330, y: 545, label: 'reads from shared memory', value: 0, size: 22, fill: K.purple });
+    const cF = S.counter({ x: 560, y: 545, label: 'multiply-adds', value: 0, size: 22, fill: K.teal });
+    const fin1 = S.text({ x: 40, y: 612, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const fin2 = S.text({ x: 40, y: 634, text: '', size: 12, fill: K.muted });
 
-    // ---- step 2: barrier
-    tl.step('<code>__syncthreads()</code>. Nobody reads the tile until every one of the 1,024 threads has finished writing into it.');
-    tl.show(barLine, 0.25);
-    tl.set(barLbl, { text: '__syncthreads() — every thread stops here until all 1,024 have arrived' }, '<');
-    tl.to(barLine, { sw: 3.2 }, 0.3, { at: '<+0.1' });
-    tl.to(barLine, { sw: 1.8 }, 0.4);
+    // ---- packets: 16 for A copies, 16 for B copies, 2 for the inner loop, 16 for the write-out
+    const pkA = [], pkB = [];
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
+      pkA.push(packet(S, 0, 0, '', K.Afill, K.A, 18));
+      pkB.push(packet(S, 0, 0, '', K.Bfill, K.B, 18));
+    }
+    const pa = packet(S, 0, 0, '', K.Afill, K.A, 18), pb = packet(S, 0, 0, '', K.Bfill, K.B, 18);
+    const pkC = [];
+    for (let i = 0; i < 16; i++) pkC.push(packet(S, 0, 0, '', K.Cfill, K.C, 18));
+
+    // copy one chunk: every thread (r,c) copies A[r][bk+c] → As[r][c] and B[bk+r][c] → Bs[r][c]
+    function copyChunk(bk, dur, slow) {
+      // A first
+      tl.set(As.allVals(), { opacity: 0 });
+      for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
+        const i = r * 4 + c, [x0, y0] = A.center(r, bk + c), [x1, y1] = As.center(r, c);
+        tl.set(pkA[i].g, { tx: x0, ty: y0 }, '<'); tl.set(pkA[i].t, { text: Am[r][bk + c] }, '<');
+        tl.set(As.valAt(r, c), { text: Am[r][bk + c] }, '<');
+      }
+      tl.to(A.block(0, bk, 4, 4), HOT_A, 0.25, { at: '<', stagger: 0.02 });
+      tl.show(pkA, 0.1, { at: '<+0.2', stagger: 0.03 });
+      tl.move(pkA, As.cells.flat().map(p => As.center(p.r, p.c)[0]), As.cells.flat().map(p => As.center(p.r, p.c)[1]), dur, { at: '<', stagger: 0.03, arc: -40 });
+      tl.to(As.all(), HOT_A, 0.15, { at: '<+' + (dur * 0.85), stagger: 0.03 });
+      tl.hide(pkA, 0.12, { at: '<', stagger: 0.03 });
+      tl.show(As.allVals(), 0.12, { at: '<', stagger: 0.03 });
+      tl.to(cG.num, { value: cG._v = (cG._v || 0) + 16 }, dur, { at: '<-' + (dur * 0.6), ease: 'linear' });
+      if (slow) { tl.wait(0.4); }
+    }
+    function copyChunkB(bk, dur) {
+      tl.set(Bs.allVals(), { opacity: 0 });
+      for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
+        const i = r * 4 + c, [x0, y0] = B.center(bk + r, c);
+        tl.set(pkB[i].g, { tx: x0, ty: y0 }, '<'); tl.set(pkB[i].t, { text: Bm[bk + r][c] }, '<');
+        tl.set(Bs.valAt(r, c), { text: Bm[bk + r][c] }, '<');
+      }
+      tl.to(B.block(bk, 0, 4, 4), HOT_B, 0.25, { at: '<', stagger: 0.02 });
+      tl.show(pkB, 0.1, { at: '<+0.2', stagger: 0.03 });
+      tl.move(pkB, Bs.cells.flat().map(p => Bs.center(p.r, p.c)[0]), Bs.cells.flat().map(p => Bs.center(p.r, p.c)[1]), dur, { at: '<', stagger: 0.03, arc: 30 });
+      tl.to(Bs.all(), HOT_B, 0.15, { at: '<+' + (dur * 0.85), stagger: 0.03 });
+      tl.hide(pkB, 0.12, { at: '<', stagger: 0.03 });
+      tl.show(Bs.allVals(), 0.12, { at: '<', stagger: 0.03 });
+      tl.to(cG.num, { value: cG._v = (cG._v || 0) + 16 }, dur, { at: '<-' + (dur * 0.6), ease: 'linear' });
+    }
+    function barrier(text) {
+      tl.show([barLine, barLbl], 0.25);
+      tl.set(barLbl, { text }, '<');
+      tl.to(T.all(), { stroke: K.accent, sw: 1.6 }, 0.25, { at: '<' });
+      tl.to(barLine, { sw: 4 }, 0.3);
+      tl.to(barLine, { sw: 2.5 }, 0.3);
+      tl.to(T.all(), { stroke: K.gold, sw: 1 }, 0.3, { at: '<' });
+    }
+    // one multiply-add for thread (1,2): As[1][d] × Bs[d][2] → tmp
+    function fma(k, dur) {
+      const d = k % 4;
+      const [ax, ay] = As.center(1, d), [bx, by] = Bs.center(d, 2), [tx, ty] = T.center(1, 2);
+      tl.set(pa.g, { tx: ax, ty: ay }); tl.set(pa.t, { text: rowA[k] }, '<');
+      tl.set(pb.g, { tx: bx, ty: by }, '<'); tl.set(pb.t, { text: colB[k] }, '<');
+      tl.to([As.cellAt(1, d), Bs.cellAt(d, 2)], { sw: 2.6 }, 0.12, { at: '<' });
+      tl.show([pa.g, pb.g], 0.1, { at: '<' });
+      tl.move(pa.g, tx, ty, dur, { at: '<', arc: -60 });
+      tl.move(pb.g, tx, ty, dur, { at: '<', arc: -30 });
+      tl.to(cS.num, { value: cS._v = (cS._v || 0) + 2 }, dur, { at: '<', ease: 'linear' });
+      tl.to([pa.g, pb.g], { scale: 0.25, opacity: 0 }, 0.18, { at: '<+' + (dur * 0.8) });
+      tl.to(T.cellAt(1, 2), { fill: '#f6e3a0' }, 0.1, { at: '<' });
+      tl.set(T.valAt(1, 2), { text: cum[k] }, '<+0.1');
+      tl.to(T.cellAt(1, 2), { fill: K.goldfill }, 0.4);
+      tl.set([pa.g, pb.g], { scale: 1 });
+      tl.show(ws[k], 0.15, { at: '<' });
+      tl.to(cF.num, { value: cF._v = (cF._v || 0) + 1 }, 0.1, { at: '<' });
+      tl.to([As.cellAt(1, d), Bs.cellAt(d, 2)], { sw: 1.4 }, 0.25, { at: '<' });
+    }
+    // every other thread finishes its four multiply-adds for this chunk
+    function everyone(P, cumAll, sExtra, fExtra) {
+      const cellsT = [];
+      for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) if (!(r === 1 && c === 2)) cellsT.push([r, c]);
+      tl.to(As.all(), { fill: K.A, stroke: K.Adeep }, 0.25, { stagger: 0.01 });
+      tl.to(Bs.all(), { fill: K.B, stroke: K.Bdeep }, 0.25, { at: '<', stagger: 0.01 });
+      tl.to(As.allVals(), { fill: '#fff' }, 0.25, { at: '<' });
+      tl.to(Bs.allVals(), { fill: '#fff' }, 0.25, { at: '<' });
+      cellsT.forEach(([r, c], i) => {
+        tl.set(T.valAt(r, c), { text: cumAll[r][c] }, i === 0 ? undefined : '<+0.05');
+        tl.to(T.cellAt(r, c), { fill: '#f6e3a0' }, 0.12, { at: '<' });
+      });
+      tl.to(cS.num, { value: cS._v = (cS._v || 0) + sExtra }, 0.8, { at: '<-0.5', ease: 'linear' });
+      tl.to(cF.num, { value: cF._v = (cF._v || 0) + fExtra }, 0.8, { at: '<', ease: 'linear' });
+      tl.to(T.all(), { fill: K.goldfill }, 0.5);
+      tl.to(As.all(), HOT_A, 0.4, { at: '<' });
+      tl.to(Bs.all(), HOT_B, 0.4, { at: '<' });
+      tl.to(As.allVals(), { fill: K.ink }, 0.4, { at: '<' });
+      tl.to(Bs.allVals(), { fill: K.ink }, 0.4, { at: '<' });
+    }
+
+    // ================= the timeline =================
+    tl.step('Sixteen threads, one per cell of C; thread (r, c) owns C[r][c]. Each starts with <code>tmp = 0</code> in a register of its own. <code>As</code> and <code>Bs</code>, the two 4 × 4 tiles in shared memory, are empty.');
+    code.go(tl, 0);
+    tl.to(T.all(), { fill: '#f6e3a0' }, 0.3, { stagger: 0.02 });
+    tl.to(T.all(), { fill: K.goldfill }, 0.4);
     tl.wait(1.6);
 
-    // ---- step 3: thread (5,9) reads
-    tl.step('Thread (5, 9) reads <b>row 5 of As</b> and <b>column 9 of Bs</b> — 64 values, every one of them from shared memory — and does 32 multiply-adds into <code>tmp</code>.');
-    readRowCol(0.5);
-    tl.set(r1, { text: 'thread (5, 9), for d = 0 … 31:' }, '<');
-    tl.set(r2, { text: 'As[5][d]     row 5 of As' }, '<+0.2');
-    tl.set(r3, { text: 'Bs[d][9]     column 9 of Bs' }, '<+0.35');
-    tl.set(r4, { text: '64 reads, 32 multiply-adds, no global memory' }, '<+0.5');
-    tl.to(cSmem.num, { value: 64 }, 0.6, { at: '<' });
-    tl.to(tmpNum.num, { value: cum[0] }, 0.9, { at: '<' });
-    tl.wait(2.0);
+    tl.step('<b>Chunk 0</b> covers k = 0 … 3: columns 0–3 of A and rows 0–3 of B, the two framed windows.');
+    code.go(tl, 1);
+    tl.show([winA, winB], 0.4);
+    tl.set(winLblA, { text: 'chunk 0: columns 0–3' }, '<');
+    tl.set(winLblB, { text: 'chunk 0: rows 0–3' }, '<');
+    tl.wait(1.5);
 
-    // ---- step 4: all 1,024 threads at once
-    tl.step('The other 1,023 threads are doing the same with their own row and column: <b>65,536 shared-memory reads</b> for the block this chunk, and not one trip to global memory.');
-    tl.to(asRest, { fill: '#a9c6f5', stroke: K.Adeep }, 0.5);
-    tl.to(bsRest, { fill: '#a7dfbb', stroke: K.Bdeep }, 0.5, { at: '<' });
-    tl.set(r5, { text: '× 1,024 threads = 65,536 reads of shared memory' }, '<');
-    tl.set(r6, { text: 'served by the 2,048 global loads the block already paid for' }, '<+0.3');
-    tl.to(cSmem.num, { value: 65536 }, 0.9, { at: '<' });
-    tl.wait(2.2);
-
-    // ---- step 5: the second barrier
-    tl.step('The second <code>__syncthreads()</code>, so that no fast thread starts overwriting As while a slow one is still reading it.');
-    tl.set(barLbl, { text: '__syncthreads() again — nobody overwrites until everybody has read' });
-    tl.to(barLine, { sw: 3.2 }, 0.3, { at: '<' });
-    tl.to(barLine, { sw: 1.8 }, 0.4);
-    tl.to(cChunk.num, { value: 1 }, 0.3, { at: '<' });
-    tl.wait(1.6);
-
-    // ---- step 6: slide and repeat
-    tl.step('Slide both windows 32 along and do it again. <code>tmp</code> is never reset, so chunk 1’s products land on top of chunk 0’s.');
-    tl.to(asCells, EMPTY, 0.3);
-    tl.to(bsCells, EMPTY, 0.3, { at: '<' });
-    tl.set(r1, { text: 'chunk 1 — the same 1,024 threads, the same 64 reads each' }, '<');
-    tl.set(g4, { text: 'the window slides 32 columns right, 128 times over' }, '<');
-    tl.move(winA, 112, 430, 0.5);
-    tl.move(winB, 330, 448, 0.5, { at: '<' });
-    loadChunk(1, 0.7, 0.0004);
-    readRowCol(0.35);
-    tl.to(cLoads.num, { value: 4096 }, 0.4, { at: '<' });
-    tl.to(cSmem.num, { value: 131072 }, 0.6, { at: '<' });
-    tl.to(tmpNum.num, { value: cum[1] }, 0.8, { at: '<' });
-    tl.to(cChunk.num, { value: 2 }, 0.4, { at: '<' });
-    tl.wait(2.0);
-
-    // ---- step 7: chunks 2 and 3 at speed
-    tl.step('Chunks 2 and 3 go by the same way: copy, barrier, 32 multiply-adds, barrier. The two strips are being eaten 32 columns at a time.');
-    for (let ch = 2; ch <= 3; ch++) {
-      tl.to(asCells, EMPTY, 0.2);
-      tl.to(bsCells, EMPTY, 0.2, { at: '<' });
-      tl.move(winA, 80 + ch * 32, 430, 0.35);
-      tl.move(winB, 330, 416 + ch * 32, 0.35, { at: '<' });
-      loadChunk(ch, 0.5, 0.0002);
-      readRowCol(0.25);
-      tl.to(cLoads.num, { value: 2048 * (ch + 1) }, 0.3, { at: '<' });
-      tl.to(cSmem.num, { value: 65536 * (ch + 1) }, 0.4, { at: '<' });
-      tl.to(tmpNum.num, { value: cum[ch] }, 0.5, { at: '<' });
-      tl.to(cChunk.num, { value: ch + 1 }, 0.3, { at: '<' });
-      tl.wait(0.6);
-    }
+    tl.step('Every thread copies <b>one</b> element of A into As: thread (r, c) takes A[r][c] of the window. Thread (1, 2) copies A[1][2] = 3. Sixteen threads, sixteen loads from global memory, all at once.');
+    code.go(tl, 2);
+    copyChunk(0, 0.9, true);
+    tl.to(As.cellAt(1, 2), { sw: 2.6 }, 0.2);
+    tl.to(As.cellAt(1, 2), { sw: 1.4 }, 0.3);
     tl.wait(1.4);
 
-    // ---- step 8: 128 chunks later
-    tl.step('… and 128 chunks later <code>tmp</code> holds the whole 4,092-term dot product. It never left the register; now it goes out to C.');
-    tl.to(cChunk.num, { value: 128 }, 1.4);
-    tl.to(cLoads.num, { value: 262144 }, 1.4, { at: '<', ease: 'linear' });
-    tl.to(cSmem.num, { value: 8388608 }, 1.4, { at: '<', ease: 'linear' });
-    tl.to(tmpNum.num, { value: TOTAL }, 1.4, { at: '<', ease: 'linear' });
-    tl.to(tmpNum.num, { fill: K.C }, 0.4);
-    tl.set(r1, { text: 'C[5][9] = alpha × tmp + beta × C[5][9]' }, '<');
-    tl.set(r4, { text: '262,144 global loads for the block, against kernel 2’s 8,380,416' }, '<');
-    tl.set(r5, { text: 'the 261,888 numbers it needs, each fetched once' }, '<+0.3');
-    tl.set(r6, { text: '' }, '<');
-    tl.wait(3.2);
+    tl.step('… and one element of B into Bs: thread (1, 2) copies B[1][2] = 5. Sixteen more loads. That is the block’s entire business with global memory for this chunk: <b>32 loads</b>.');
+    code.go(tl, 3);
+    copyChunkB(0, 0.9);
+    tl.to(Bs.cellAt(1, 2), { sw: 2.6 }, 0.2);
+    tl.to(Bs.cellAt(1, 2), { sw: 1.4 }, 0.3);
+    tl.wait(1.4);
+
+    tl.step('<code>__syncthreads()</code>: every thread stops here until all sixteen copies have landed. Only then is it safe to read As and Bs.');
+    code.go(tl, 4);
+    barrier('__syncthreads() — all 16 threads wait here');
+    tl.wait(1.6);
+
+    tl.step('Now the arithmetic, from shared memory only. Thread (1, 2) needs <b>row 1 of As</b> and <b>column 2 of Bs</b>. d = 0: As[1][0] × Bs[0][2] = 1 × 1 = 1, so <code>tmp</code> = 1.');
+    code.go(tl, 5, 2);
+    tl.hide([barLine, barLbl], 0.3);
+    tl.to(As.row(1), { fill: '#b9d0f7' }, 0.3, { at: '<', stagger: 0.05 });
+    tl.to(Bs.col(2), { fill: '#b6e3c6' }, 0.3, { at: '<', stagger: 0.05 });
+    fma(0, 0.8);
+    tl.wait(1.4);
+
+    tl.step('d = 1: 3 × 5 = 15 → 16.  d = 2: 3 × 9 = 27 → 43.  d = 3: 8 × 1 = 8 → <b>51</b>. Four multiply-adds, eight reads, all from shared memory, none from global.');
+    code.go(tl, 6);
+    for (let k = 1; k < 4; k++) { fma(k, 0.55); tl.wait(0.25); }
+    tl.wait(1.4);
+
+    tl.step('All sixteen threads do this at the same time, each on its own row of As and column of Bs. Each As value is read by the four threads of its row, each Bs value by the four of its column: <b>128 shared-memory reads</b>, served by 32 global loads.');
+    tl.to(As.row(1), HOT_A, 0.3);
+    tl.to(Bs.col(2), HOT_B, 0.3, { at: '<' });
+    everyone(P0, P0, 120, 60);
+    tl.wait(2.0);
+
+    tl.step('<code>__syncthreads()</code> again: nobody may overwrite As and Bs while a slower thread is still reading them.');
+    code.go(tl, 7);
+    barrier('__syncthreads() — all 16 have finished reading');
+    tl.wait(1.4);
+
+    tl.step('<b>Chunk 1</b> covers k = 4 … 7. The windows slide: columns 4–7 of A, rows 4–7 of B. Same sixteen threads, same As and Bs, new contents.');
+    code.go(tl, 1);
+    tl.hide([barLine, barLbl], 0.3);
+    tl.to(A.block(0, 0, 4, 4), GMA, 0.4, { at: '<' });
+    tl.to(B.block(0, 0, 4, 4), GMB, 0.4, { at: '<' });
+    tl.to(winA, { tx: 4 * cell }, 0.6, { at: '<' });
+    tl.to(winB, { ty: 4 * cell }, 0.6, { at: '<' });
+    tl.set(winLblA, { text: 'chunk 1: columns 4–7' }, '<+0.3');
+    tl.set(winLblB, { text: 'chunk 1: rows 4–7' }, '<');
+    tl.to(As.all(), { fill: '#fff', stroke: '#d9d2ea', sw: 0.7 }, 0.4);
+    tl.to(Bs.all(), { fill: '#fff', stroke: '#d9d2ea', sw: 0.7 }, 0.4, { at: '<' });
+    tl.hide(As.allVals(), 0.2, { at: '<' });
+    tl.hide(Bs.allVals(), 0.2, { at: '<' });
+    tl.wait(1.4);
+
+    tl.step('Each thread copies one element of each again: thread (1, 2) now copies A[1][6] = 5 and B[5][2] = 6. Global loads for the block so far: <b>64</b>. Then the barrier.');
+    code.go(tl, 2, 3);
+    copyChunk(4, 0.7, false);
+    copyChunkB(4, 0.7);
+    tl.wait(0.3);
+    barrier('__syncthreads()');
+    tl.wait(1.2);
+
+    tl.step('Four more multiply-adds for thread (1, 2): 9 × 6 = 54, 1 × 6 = 6, 5 × 4 = 20, 8 × 5 = 40. <code>tmp</code> goes 51 → 105 → 111 → 131 → <b>171</b>. The other fifteen finish theirs too.');
+    code.go(tl, 5, 2);
+    tl.hide([barLine, barLbl], 0.3);
+    tl.to(As.row(1), { fill: '#b9d0f7' }, 0.3, { at: '<', stagger: 0.05 });
+    tl.to(Bs.col(2), { fill: '#b6e3c6' }, 0.3, { at: '<', stagger: 0.05 });
+    for (let k = 4; k < 8; k++) { fma(k, 0.55); tl.wait(0.25); }
+    tl.to(As.row(1), HOT_A, 0.3);
+    tl.to(Bs.col(2), HOT_B, 0.3, { at: '<' });
+    everyone(P1, Cm, 120, 60);
+    code.go(tl, 7);
+    barrier('__syncthreads()');
+    tl.wait(1.6);
+
+    tl.step('That was the whole dot product, row 1 of A with column 2 of B, and 171 is C[1][2]. Every thread writes its <code>tmp</code> out. C is complete, and every value matches the plain multiplication.');
+    code.go(tl, 9);
+    tl.hide([barLine, barLbl], 0.3);
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
+      const i = r * 4 + c, [x0, y0] = T.center(r, c), [x1, y1] = C.center(r, c);
+      tl.set(pkC[i].g, { tx: x0, ty: y0 }, i === 0 ? '<' : '<'); tl.set(pkC[i].t, { text: Cm[r][c] }, '<');
+    }
+    tl.show(pkC, 0.1, { stagger: 0.03 });
+    tl.move(pkC, C.cells.flat().map(p => C.center(p.r, p.c)[0]), C.cells.flat().map(p => C.center(p.r, p.c)[1]), 0.6, { at: '<', stagger: 0.03 });
+    tl.to(C.all(), { fill: K.Cfill, stroke: K.C }, 0.15, { at: '<+0.55', stagger: 0.03 });
+    tl.hide(pkC, 0.1, { at: '<', stagger: 0.03 });
+    tl.show(C.allVals(), 0.1, { at: '<', stagger: 0.03 });
+    tl.to(C.cellAt(1, 2), { fill: '#fbd3ae' }, 0.3);
+    tl.wait(1.8);
+
+    tl.step('The bill for the block: <b>64 loads from global memory</b>, each of the 64 distinct values exactly once, where kernel 2 issued 256. Scale 4 up to 32 and 8 up to 4,092 and this is the real kernel.');
+    tl.set(fin1, { text: '64 global loads · 256 shared-memory reads · 128 multiply-adds — the arithmetic is identical to kernel 2’s' });
+    tl.set(fin2, { text: 'kernel 2 on the same block: 256 global loads. Real kernel: 262,144 against 8,380,416 — the same factor, 32 instead of 4.' }, '<+0.4');
+    tl.wait(3.5);
     S.finish();
   })();
 
@@ -595,11 +724,11 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
     const X0 = 160, D1 = 390, D2 = 620, XEND = 850;
     const laneY = i => 100 + i * 28;
 
-    S.text({ x: 40, y: 28, text: 'Eight of the block’s 1,024 threads, running left to right through one chunk.', size: 13, fill: K.ink, weight: 600 });
+    S.text({ x: 40, y: 28, text: 'Eight of a block’s threads, running left to right through one chunk.', size: 13, fill: K.ink, weight: 600 });
     S.text({ x: 40, y: 46, text: 'The schedulers run whichever warp is ready, so they do not arrive anywhere together.', size: 11, fill: K.muted });
 
     S.text({ x: 275, y: 64, text: 'copy one element into As and Bs', anchor: 'middle', size: 11.5, fill: K.muted });
-    S.text({ x: 505, y: 64, text: 'read 64 values, do 32 multiply-adds', anchor: 'middle', size: 11.5, fill: K.muted });
+    S.text({ x: 505, y: 64, text: 'read row and column, multiply-add', anchor: 'middle', size: 11.5, fill: K.muted });
     S.text({ x: 735, y: 64, text: 'the next chunk’s copy', anchor: 'middle', size: 11.5, fill: K.muted });
     [D1, D2].forEach(x => S.line({ x1: x, y1: 76, x2: x, y2: 312, stroke: K.faint, sw: 1.2, dash: '5 4' }));
 
@@ -618,7 +747,7 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
     const gateL2 = S.text({ x: D2, y: 332, text: '', anchor: 'middle', size: 11, fill: K.accent, weight: 600, font: 'mono' });
 
     const slotBox = S.rect({ x: 600, y: 344, w: 260, h: 54, fill: '#fff', stroke: K.rule, sw: 1, rx: 6, opacity: 0 });
-    const slotLbl = S.text({ x: 614, y: 362, text: 'the slot As[5][17]', font: 'mono', size: 11, fill: K.muted, opacity: 0 });
+    const slotLbl = S.text({ x: 614, y: 362, text: 'the slot As[1][3]', font: 'mono', size: 11, fill: K.muted, opacity: 0 });
     const slotVal = S.text({ x: 614, y: 384, text: '?', size: 16, fill: K.red, weight: 600, opacity: 0 });
     const slotNote = S.text({ x: 848, y: 384, text: '', anchor: 'end', size: 10.5, fill: K.red });
 
@@ -630,7 +759,7 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
     tl.set(v1, { text: 'thread 2 has finished its copy; thread 6 has barely started' }, '<+0.8');
     tl.wait(1.6);
 
-    tl.step('Without a barrier, thread 2 walks straight into its <b>read</b> while thread 6 is still copying — and reads As[5][17] before anyone has written it.');
+    tl.step('Without a barrier, thread 2 walks straight into its <b>read</b> while thread 6 is still copying — and reads As[1][3] before anyone has written it.');
     tl.move(dots[2], 480, laneY(2), 0.9);
     tl.to(dots[2], { fill: K.red }, 0.4, { at: '<+0.3' });
     tl.show([slotBox, slotLbl, slotVal], 0.4, { at: '<' });
@@ -639,7 +768,7 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
     tl.set(v2, { text: 'the answer comes out wrong — sometimes, depending on how the warps were scheduled' }, '<+0.3');
     tl.wait(2.4);
 
-    tl.step('<code>__syncthreads()</code> is a meeting point. Every thread of the block stops at that line until <b>all 1,024</b> have arrived.');
+    tl.step('<code>__syncthreads()</code> is a meeting point. Every thread of the block stops at that line until <b>all of them</b> have arrived.');
     tl.hide([slotBox, slotLbl, slotVal], 0.3);
     tl.set(slotNote, { text: '' }, '<');
     tl.set(v2, { text: '' }, '<');
@@ -668,66 +797,122 @@ C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol]
     S.finish();
   })();
 
-  // ------------------------------------------------------------ 6.6 how that turns into FLOPs
+  // ------------------------------------------------------------ 6.6 the sliding window at full size
   (function () {
-    const S = MB.scene('a-ledger3', { w: 900, h: 440, title: 'Kernel 3 against kernel 2: traffic, loads per output, and speed' });
+    const S = MB.scene('a-window', { w: 900, h: 330, title: 'The 32-wide window sliding along a 4,092-long row of A, 128 times, while one register accumulates' });
     const tl = S.tl;
-    const X = 300, W = 460;
-    const track = { fill: '#f6f4ee', stroke: K.rule, sw: 0.8, rx: 3 };
-    const gf = v => (Math.round(v * 10) / 10).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    const rA = MB.rng(11), rB = MB.rng(12);
+    const av = Array.from({ length: 4092 }, () => 1 + Math.floor(rA() * 9));
+    const bv = Array.from({ length: 4092 }, () => 1 + Math.floor(rB() * 9));
+    const cum = []; let acc = 0;
+    for (let ch = 0; ch < 128; ch++) { let s = 0; for (let d = 0; d < 32; d++) { const i = 32 * ch + d; if (i < 4092) s += av[i] * bv[i]; } acc += s; cum.push(acc); }
+    const X = 40, W = 640, Y = 96, H = 44, cw = W / 128;   // 5 px per chunk
 
-    S.text({ x: 40, y: 28, text: 'Kernel 3 against kernel 2, on the same 4,092 × 4,092 multiply.', size: 13, fill: K.ink, weight: 600 });
+    S.text({ x: 40, y: 30, text: 'thread (5, 9) of the real kernel: row 5 of its block’s strip of A, 4,092 floats long', size: 13, fill: K.ink, weight: 600 });
+    S.text({ x: 40, y: 50, text: 'shared memory holds 32 of them at a time; the window slides 32 columns to the right, 128 times', size: 11, fill: K.muted });
+    S.rect({ x: X, y: Y, w: W, h: H, fill: '#eef3fb', stroke: '#b9cdf0', sw: 1, rx: 3 });
+    const done = S.rect({ x: X, y: Y, w: 0, h: H, fill: K.Afill, stroke: 'none', rx: 3 });
+    const win = S.rect({ x: X, y: Y - 4, w: cw, h: H + 8, fill: 'none', stroke: K.accent, sw: 2, rx: 1 });
+    S.text({ x: X, y: Y + H + 16, text: 'k = 0', size: 10.5, fill: K.muted });
+    S.text({ x: X + W, y: Y + H + 16, text: 'k = 4,091', anchor: 'end', size: 10.5, fill: K.muted });
+    const winLbl = S.text({ x: X + cw / 2, y: Y - 14, text: 'chunk 0', anchor: 'middle', size: 10.5, fill: K.accent, weight: 600 });
 
+    const cChunk = S.counter({ x: 40, y: 200, label: 'chunks done', value: 0, size: 22, format: v => Math.round(v) + ' of 128' });
+    const cLoads = S.counter({ x: 230, y: 200, label: 'global loads by this thread', value: 0, size: 22, fill: K.grey });
+    const cSm = S.counter({ x: 460, y: 200, label: 'shared-memory reads by this thread', value: 0, size: 22, fill: K.purple });
+    S.rect({ x: 720, y: 84, w: 150, h: 68, fill: K.goldfill, stroke: K.gold, sw: 1.2, rx: 8 });
+    S.text({ x: 795, y: 74, text: 'tmp — its register', anchor: 'middle', size: 11, fill: K.muted });
+    const tmp = S.counter({ x: 795, y: 120, value: 0, size: 22, anchor: 'middle' });
+    const note = S.text({ x: 40, y: 280, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    const note2 = S.text({ x: 40, y: 302, text: '', size: 12, fill: K.muted });
+
+    function chunk(ch, dur) {
+      tl.to(win, { tx: ch * cw }, dur * 0.4);
+      tl.set(winLbl, { text: 'chunk ' + ch }, '<'); tl.to(winLbl, { tx: ch * cw }, dur * 0.4, { at: '<' });
+      tl.to(done, { width: (ch + 1) * cw }, dur * 0.6);
+      tl.to(tmp.num, { value: cum[ch] }, dur * 0.6, { at: '<' });
+      tl.to(cChunk.num, { value: ch + 1 }, dur * 0.6, { at: '<' });
+      tl.to(cLoads.num, { value: 2 * (ch + 1) }, dur * 0.6, { at: '<' });
+      tl.to(cSm.num, { value: 64 * (ch + 1) }, dur * 0.6, { at: '<' });
+    }
+    tl.step('Chunk 0: the thread copies one element of A and one of B, waits, reads its 32-long row of As and column of Bs, and adds 32 products into <code>tmp</code>.');
+    chunk(0, 1.4);
+    tl.set(note, { text: 'per chunk: 2 global loads, 64 shared-memory reads, 32 multiply-adds — exactly the miniature with 4 replaced by 32' });
+    tl.wait(1.6);
+    tl.step('Chunks 1, 2, 3: the window slides 32 columns each time and the same thing happens again, into the same register.');
+    for (let ch = 1; ch <= 3; ch++) { chunk(ch, 1.0); tl.wait(0.2); }
+    tl.wait(1.2);
+    tl.step('Fast-forward: 128 chunks, the last one 28 wide because 4,092 is not a multiple of 32.');
+    for (let ch = 4; ch < 128; ch++) chunk(ch, 0.03);
+    tl.set(note2, { text: '' });
+    tl.wait(1.0);
+    tl.step('After 128 slides <code>tmp</code> holds the full 4,092-term dot product and goes to C. This thread made <b>256 global loads</b> (K/16) where kernel 2’s made 8,184 (2K).');
+    tl.to(tmp.num, { fill: K.C }, 0.4);
+    tl.set(note2, { text: 'tmp never left its register · 256 global loads against 8,184 · 8,192 shared-memory reads served by them' }, '<');
+    tl.wait(3.0);
+    S.finish();
+  })();
+
+  // ------------------------------------------------------------ 6.7 the miniature scaled up, and the measurement
+  (function () {
+    const S = MB.scene('a-scale', { w: 900, h: 470, title: 'The miniature scaled to Boehm’s kernel, and the measured speed' });
+    const tl = S.tl;
+    S.text({ x: 40, y: 28, text: 'Replace every 4 by 32 and the 8 by 4,092. Every count scales the same way.', size: 13, fill: K.ink, weight: 600 });
+    const X1 = 40, X2 = 380, X3 = 600;
+    S.text({ x: X2, y: 60, text: 'miniature', size: 11.5, fill: K.muted, weight: 600 });
+    S.text({ x: X3, y: 60, text: 'Boehm’s kernel 3', size: 11.5, fill: K.muted, weight: 600 });
+    S.line({ x1: 40, y1: 70, x2: 860, y2: 70, stroke: K.rule, sw: 1 });
     const rows = [
-      { title: 'global loads per block, over the whole k loop', y: 76, max: 8380416 },
-      { title: 'global loads per element of C', y: 166, max: 8184 },
-      { title: 'speed on the whole multiply, GFLOP/s', y: 256, max: 3000 },
+      ['BLOCKSIZE', 4, 32, v => MB.fmt(v)],
+      ['K, the length of each dot product', 8, 4092, v => MB.fmt(v)],
+      ['threads per block', 16, 1024, v => MB.fmt(v)],
+      ['chunks of k', 2, 128, v => MB.fmt(v)],
+      ['bytes in As + Bs', 128, 8192, v => v >= 1024 ? MB.fmt(v / 1024) + ' KB' : MB.fmt(v) + ' B'],
+      ['global loads per block, kernel 2', 256, 8380416, v => MB.fmt(v)],
+      ['global loads per block, kernel 3', 64, 262144, v => MB.fmt(v)],
+      ['global loads per output, kernel 2 → 3', 0, 0, null],
+      ['shared reads per global load', 4, 32, v => MB.fmt(v)],
     ];
-    rows.forEach(r => {
-      S.text({ x: 40, y: r.y - 14, text: r.title, size: 12.5, fill: K.ink, weight: 600 });
-      S.rect(Object.assign({ x: X, y: r.y, w: W, h: 20 }, track));
-      S.rect(Object.assign({ x: X, y: r.y + 28, w: W, h: 20 }, track));
+    const vals = [];
+    rows.forEach((r, i) => {
+      const y = 92 + i * 26;
+      S.text({ x: X1, y, text: r[0], size: 12, fill: K.ink });
+      if (r[3]) {
+        S.text({ x: X2, y, text: r[3](r[1]), font: 'mono', size: 12, fill: K.ink });
+        const c = S.counter({ x: X3, y, value: r[1], size: 13, fill: K.accent, format: r[3], opacity: 0 });
+        c.num.node.setAttribute('class', 'f-mono'); vals.push([c, r[2]]);
+      } else {
+        S.text({ x: X2, y, text: '16 → 4', font: 'mono', size: 12, fill: K.ink });
+        const t = S.text({ x: X3, y, text: '8,184 → 256', font: 'mono', size: 12, fill: K.accent, opacity: 0 }); vals.push([{ num: t }, null]);
+      }
     });
-    const ratio = rows.map(r => S.text({ x: 858, y: r.y - 14, text: '', anchor: 'end', size: 12.5, fill: K.accent, weight: 600 }));
+    const ratioNote = S.text({ x: X1, y: 92 + 9 * 26 + 6, text: '', size: 12.5, fill: K.ink, weight: 600 });
+    // speed bars
+    const BY = 372, BX = 300, BW = 460;
+    S.text({ x: 40, y: BY - 16, text: 'measured speed on the whole 4,092 × 4,092 multiply, GFLOP/s', size: 12.5, fill: K.ink, weight: 600 });
+    S.rect({ x: BX, y: BY, w: BW, h: 20, fill: '#f6f4ee', stroke: K.rule, sw: 0.8, rx: 3 });
+    S.rect({ x: BX, y: BY + 28, w: BW, h: 20, fill: '#f6f4ee', stroke: K.rule, sw: 0.8, rx: 3 });
+    const gf = v => (Math.round(v * 10) / 10).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    const b2 = S.bar({ x: BX, y: BY, w: 0, h: 20, fill: '#e6e3da', stroke: K.grey, label: 'kernel 2', value: 0, format: gf });
+    const b3 = S.bar({ x: BX, y: BY + 28, w: 0, h: 20, fill: K.Cfill, stroke: K.C, label: 'kernel 3', value: 0, format: gf });
+    const verdict = S.text({ x: 40, y: BY + 78, text: '', size: 13, fill: K.red, weight: 600 });
 
-    const b2a = S.bar({ x: X, y: 76, w: 0, h: 20, fill: K.redfill, stroke: K.red, label: 'kernel 2', value: 0 });
-    const b3a = S.bar({ x: X, y: 104, w: 0, h: 20, fill: K.tealfill, stroke: K.teal, label: 'kernel 3', value: 0 });
-    const b2b = S.bar({ x: X, y: 166, w: 0, h: 20, fill: K.redfill, stroke: K.red, label: 'kernel 2', value: 0, opacity: 0 });
-    const b3b = S.bar({ x: X, y: 194, w: 0, h: 20, fill: K.tealfill, stroke: K.teal, label: 'kernel 3', value: 0, opacity: 0 });
-    const b2c = S.bar({ x: X, y: 256, w: 0, h: 20, fill: K.redfill, stroke: K.red, label: 'kernel 2', value: 0, format: gf, opacity: 0 });
-    const b3c = S.bar({ x: X, y: 284, w: 0, h: 20, fill: K.tealfill, stroke: K.teal, label: 'kernel 3', value: 0, format: gf, opacity: 0 });
-
-    const n1 = S.text({ x: 40, y: 336, text: '', size: 12, fill: K.muted });
-    const v1 = S.text({ x: 40, y: 372, text: '', size: 14, fill: K.ink, weight: 600 });
-    const v2 = S.text({ x: 40, y: 398, text: '', size: 12.5, fill: K.muted });
-    const v3 = S.text({ x: 40, y: 422, text: '', size: 12.5, fill: K.accent, weight: 600 });
-
-    tl.step('Loads from global memory, per block, for the whole k loop. Kernel 2 issued <b>8,380,416</b> of them; kernel 3 issues <b>262,144</b>.');
-    b2a.grow(tl, W, 8380416, 1.1);
-    b3a.grow(tl, W * 262144 / 8380416, 262144, 1.1, { at: '<+0.3' });
-    tl.set(ratio[0], { text: '32× fewer' }, '<+0.6');
-    tl.set(n1, { text: '262,144 loads for the 261,888 numbers the block needs — near enough one apiece' }, '<+0.2');
-    tl.wait(2.2);
-
-    tl.step('Per element of C, the same story: kernel 2 spent <b>2K = 8,184</b> global loads on every output, kernel 3 spends <b>K/16 = 256</b>.');
-    tl.show([b2b, b3b], 0.3);
-    b2b.grow(tl, W, 8184, 1.0, { at: '<' });
-    b3b.grow(tl, W * 256 / 8184, 256, 1.0, { at: '<+0.3' });
-    tl.set(ratio[1], { text: '32× fewer' }, '<+0.6');
+    tl.step('The miniature’s numbers, in the middle column. Everything in the chapter so far was one of these.');
+    tl.wait(1.6);
+    tl.step('Scale up: 4 becomes 32 and 8 becomes 4,092, and each count follows. The block’s global loads go from 256 to 8,380,416 in kernel 2, and from 64 to 262,144 in kernel 3.');
+    vals.forEach(([c, target], i) => {
+      tl.show(target !== null ? c : c.num, 0.2, { at: i === 0 ? undefined : '<+0.15' });
+      if (target !== null) tl.to(c.num, { value: target }, 1.2, { at: '<', ease: 'out' });
+    });
+    tl.wait(1.8);
+    tl.step('The ratio is the tile’s edge length in both cases: 4 in the miniature, 32 in the real kernel. Traffic into the block falls by 32.');
+    tl.set(ratioNote, { text: '8,380,416 ÷ 262,144 = 32  ·  and 262,144 is almost exactly the 261,888 distinct values the block needs' });
     tl.wait(2.0);
-
-    tl.step('And the speed: <b>1,986.5 GFLOP/s to 2,980.3</b>. A factor of <b>1.5</b>.');
-    tl.show([b2c, b3c], 0.3);
-    b2c.grow(tl, W * 1986.5 / 3000, 1986.5, 1.0, { at: '<' });
-    b3c.grow(tl, W * 2980.3 / 3000, 2980.3, 1.0, { at: '<+0.3' });
-    tl.set(ratio[2], { text: '1.5× faster' }, '<+0.6');
-    tl.wait(2.2);
-
-    tl.step('A <b>32× cut in traffic bought 1.5×</b>. That is not a disappointment to shrug at — it is information. Something else became the limit while we were fixing DRAM.');
-    tl.set(v1, { text: '32× less traffic  ·  1.5× more speed  ·  12.8% of cuBLAS, up from 8.5%' });
-    tl.set(v2, { text: 'if global memory were still the limit, a 32× cut would have shown up as something near 32×' }, '<+0.4');
-    tl.set(v3, { text: 'so it is not the limit any more. What is? — chapter 7' }, '<+0.4');
-    tl.wait(3.2);
+    tl.step('And the measurement: <b>1,986.5 → 2,980.3 GFLOP/s</b>. A factor of 1.5. A 32× cut in traffic bought 1.5× in speed — something else is now the limit. That is chapter 7.');
+    b2.grow(tl, BW * 1986.5 / 3000, 1986.5, 0.9);
+    b3.grow(tl, BW * 2980.3 / 3000, 2980.3, 0.9);
+    tl.set(verdict, { text: '32× less traffic, 1.5× more speed: global memory is no longer what the kernel waits on' }, '<+0.6');
+    tl.wait(3.5);
     S.finish();
   })();
 })();

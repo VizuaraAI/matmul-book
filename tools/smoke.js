@@ -106,7 +106,7 @@ function run(file) {
   // scripts in document order
   const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/g; let m; let ok = true;
   while ((m = re.exec(html))) {
-    const src = (m[1].match(/\bsrc="([^"]+)"/) || [])[1];
+    const src = ((m[1].match(/\bsrc="([^"]+)"/) || [])[1] || '').replace(/\?.*$/, '') || undefined;
     let code, name, lineOffset = 0;
     if (src) { const p = path.join(ROOT, src); if (!fs.existsSync(p)) { problems.push(`script not found: ${src}`); ok = false; continue; } code = fs.readFileSync(p, 'utf8'); name = src; }
     else { code = m[2]; name = file + ' (inline script)'; lineOffset = html.slice(0, m.index + m[0].indexOf('>') + 1).split('\n').length - 1; }
@@ -179,7 +179,7 @@ function dumpFrames(file, dir) {
   const ctx = vm.createContext(sandbox);
   const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/g; let m;
   while ((m = re.exec(html))) {
-    const src = (m[1].match(/\bsrc="([^"]+)"/) || [])[1];
+    const src = ((m[1].match(/\bsrc="([^"]+)"/) || [])[1] || '').replace(/\?.*$/, '') || undefined;
     const code = src ? fs.readFileSync(path.join(ROOT, src), 'utf8') : m[2];
     vm.runInContext(code, ctx, { filename: src || file });
   }

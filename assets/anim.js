@@ -205,6 +205,7 @@
     tile(o) { return this._tile(this.root, o); }
     bar(o) { return this._bar(this.root, o); }
     tape(o) { return this._tape(this.root, o); }
+    code(o) { return this._code(this.root, o); }
 
     _reg(p) { this.prims.push(p); return p; }
     _rect(parent, o) {
@@ -234,7 +235,7 @@
     _text(parent, o) {
       o = Object.assign({ size: 13, fill: K.ink, anchor: 'start', font: 'sans' }, o);
       const { x, y, text, font, ...rest } = o;
-      const n = el('text', { x, y, class: 'f-' + font, 'dominant-baseline': o.baseline || 'middle' }, parent);
+      const n = el('text', { x, y, class: 'f-' + font, 'dominant-baseline': o.baseline || 'middle', 'xml:space': 'preserve', style: 'white-space:pre' }, parent);
       delete rest.baseline;
       n.textContent = text == null ? '' : text;
       const p = new Prim(this, n, rest);
@@ -396,6 +397,33 @@
       // grow the bar to width w while its readout counts to v
       bar.grow = (tl, w, v, dur, opts) => { tl.to(rect, { width: w }, dur, opts); tl.to(value, { x: w + 8, value: v }, dur, { at: '<', ease: (opts && opts.ease) || 'inOut' }); return tl; };
       return bar;
+    }
+    // A code panel: mono lines with a movable highlight bar, so an animation can point at
+    // the line of the kernel it is currently acting out. code.go(tl, line, count, dur, opts).
+    _code(parent, o) {
+      o = Object.assign({ size: 11.5, lh: 16.5, w: 440, fill: K.ink, bg: '#f7f5ef', stroke: K.rule, hl: '#fbe3bf', pad: 10 }, o);
+      const g = new Group(this, parent, { tx: o.x, ty: o.y, opacity: o.opacity === undefined ? 1 : o.opacity });
+      const H = o.lines.length * o.lh + o.pad * 2;
+      const box = this._reg(new Prim(this, el('rect', { x: 0, y: 0, width: o.w, height: H }, g.node), { fill: o.bg, stroke: o.stroke, sw: 1, rx: 8 }));
+      const bar = this._reg(new Prim(this, el('rect', { x: 4, y: o.pad, width: o.w - 8, height: o.lh }, g.node), { fill: o.hl, stroke: 'none', rx: 3, opacity: 0 }));
+      const lines = o.lines.map((s, i) => {
+        const isComment = /^\s*\/\//.test(s);
+        const t = this._reg(new Prim(this, el('text', { x: o.pad, y: o.pad + i * o.lh + o.lh / 2 + 0.5, class: 'f-mono', 'dominant-baseline': 'middle', 'xml:space': 'preserve', style: 'white-space:pre' }, g.node), { fill: isComment ? '#8d867a' : o.fill, size: o.size }));
+        t.node.textContent = s; t.props.text = s; return t;
+      });
+      let title = null;
+      if (o.title) {
+        title = this._reg(new Prim(this, el('text', { x: 0, y: -10, class: 'f-sans', 'dominant-baseline': 'middle' }, g.node), { fill: K.muted, size: 11, weight: 600 }));
+        title.node.textContent = o.title; title.props.text = o.title;
+      }
+      const code = { g, box, bar, lines, title, h: H, w: o.w, lh: o.lh };
+      code.go = (tl, line, count, dur, opts) => {
+        count = count || 1; dur = dur === undefined ? 0.25 : dur;
+        tl.to(bar, { y: o.pad + line * o.lh, height: count * o.lh, opacity: 1 }, dur, opts);
+        return tl;
+      };
+      code.off = (tl, dur, opts) => tl.to(bar, { opacity: 0 }, dur === undefined ? 0.25 : dur, opts);
+      return code;
     }
     // A 1-D memory tape: n consecutive cells (the row-major picture of a matrix).
     _tape(parent, o) {

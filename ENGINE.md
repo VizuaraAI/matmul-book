@@ -156,3 +156,18 @@ tool and check: no overlapping text, nothing running past the right edge (x > 86
 element the caption mentions is visible, counters show the right numbers. Fix and re-render
 until every sheet is clean. (Arrows like → may render as boxes in these PNGs; that is the
 renderer's font, not a bug.)
+
+## Code-synced animations (`S.code`)
+
+`S.code({x, y, w, title, lines: ['…', '…']})` draws a mono code panel with a movable highlight
+bar. `code.go(tl, line, count, dur)` slides the bar to `line` (0-based, `count` lines tall);
+`code.off(tl)` hides it. Call `code.go` right after each `tl.step()` so the reader sees which
+line of the kernel the step is acting out. Chapter 6's figure 6.4 is the exemplar: a miniature
+of the kernel (BLOCKSIZE 4, K 8, 16 threads) drawn cell by cell, with real numbers flying
+between memories, a per-thread worksheet, live counters, and the code bar in sync.
+
+**The clarity rule this came from (Raj, chapter 6 review):** an animation of counters and
+5-pixel cells explains the *accounting* but not the *mechanism*. When a kernel is the subject,
+shrink it to a size where every thread, every value and every load can be drawn (use the shared
+8 × 8 example so the numbers are real), show one thread's work in full and the other threads in
+parallel, and sync the code. Accounting figures come after the mechanism, never instead of it.
